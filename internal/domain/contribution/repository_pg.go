@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
@@ -147,6 +148,20 @@ func (r *pgRepo) ListByUser(ctx context.Context, userID uuid.UUID, page, limit i
 		return nil, 0, fmt.Errorf("iterating contributions: %w", err)
 	}
 	return contributions, total, nil
+}
+
+func (r *pgRepo) StatsByUser(ctx context.Context, userID uuid.UUID) (float64, *time.Time, error) {
+	var volume float64
+	var lastAt sql.NullTime
+	query := `SELECT COALESCE(SUM(amount), 0), MAX(created_at) FROM contributions WHERE user_id = $1 AND status = $2`
+	if err := r.db.QueryRowxContext(ctx, query, userID, StatusConfirmed).Scan(&volume, &lastAt); err != nil {
+		return 0, nil, fmt.Errorf("aggregating user contributions: %w", err)
+	}
+	if !lastAt.Valid {
+		return volume, nil, nil
+	}
+	t := lastAt.Time
+	return volume, &t, nil
 }
 
 func (r *pgRepo) ListByCircle(ctx context.Context, circleID uuid.UUID, page, limit int) ([]Contribution, int, error) {

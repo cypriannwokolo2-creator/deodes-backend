@@ -18,6 +18,8 @@ package main
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -115,6 +117,46 @@ type communityAdapter struct {
 
 func (a *communityAdapter) IsMember(ctx context.Context, communityID, userID uuid.UUID) (bool, error) {
 	return a.repo.IsMember(ctx, communityID, userID)
+}
+
+// streakAdapter feeds DeoScore streak input from the incentives service. A
+// user with no streak row yet reads as zero, not an error.
+type streakAdapter struct {
+	svc incentives.Service
+}
+
+func (a *streakAdapter) CurrentStreak(ctx context.Context, userID string) (int, error) {
+	streak, err := a.svc.GetStreak(ctx, userID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	if streak == nil {
+		return 0, nil
+	}
+	return streak.CurrentStreak, nil
+}
+
+// completionsAdapter feeds DeoScore completion input by counting the
+// user's completed circles.
+type completionsAdapter struct {
+	svc circle.Service
+}
+
+func (a *completionsAdapter) CompletedCircles(ctx context.Context, userID string) (int, error) {
+	circles, err := a.svc.GetUserCircles(ctx, userID)
+	if err != nil {
+		return 0, err
+	}
+	completed := 0
+	for i := range circles {
+		if circles[i].Status == circle.CircleStatusCompleted {
+			completed++
+		}
+	}
+	return completed, nil
 }
 
 // userLookupAdapter resolves a notification.Recipient from user.Repository —
@@ -706,6 +748,22 @@ func main() {
 
 	incentivesRepo := incentives.NewRepository(db)
 	incentivesSvc := incentives.NewService(incentivesRepo)
+
+	// DeoScore pipeline: confirmed contributions refresh the contributor's
+	// score (snapshot + users.moi_score) best-effort, and the admin
+	// recalculate endpoint backfills everyone. Before this wiring nothing
+	// ever wrote to either store, so every score sat at its signup zero.
+	scoreRefresher := reputation.NewRefresher(
+		contribRepo,
+		&streakAdapter{svc: incentivesSvc},
+		&completionsAdapter{svc: circleSvc},
+		reputationSvc,
+		userRepo,
+	)
+	if cwc, ok := contribSvc.(contribution.ServiceWithCircle); ok {
+		cwc.SetScoreUpdater(scoreRefresher)
+	}
+	adminH.WithScoreRefresher(scoreRefresher)
 	reputationH := handler.NewReputationHandler(reputationSvc)
 	referralH := handler.NewReferralHandler(incentivesSvc)
 

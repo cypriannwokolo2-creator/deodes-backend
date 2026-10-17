@@ -130,12 +130,16 @@ func (h *ReputationHandler) GetTierByAddress(c *gin.Context) {
 		address = middleware.GetUserID(c)
 	}
 
-	// CalculateScore with zero parameters fetches the latest stored snapshot.
-	// If no snapshot exists the service returns a fresh Bronze-level result.
-	snapshot, err := h.service.CalculateScore(c.Request.Context(), address, 0, 0, 0, 0)
+	// Prefer the stored snapshot (written on every confirmed contribution):
+	// it reflects earned history. Only users with no snapshot yet get a
+	// fresh zero-input calculation (Bronze entry, recency-only 150).
+	snapshot, err := h.service.LatestScore(c.Request.Context(), address)
 	if err != nil {
-		response.NotFound(c, "reputation data not found for address")
-		return
+		snapshot, err = h.service.CalculateScore(c.Request.Context(), address, 0, 0, 0, 0)
+		if err != nil {
+			response.NotFound(c, "reputation data not found for address")
+			return
+		}
 	}
 
 	tier := tierForScore(snapshot.Score)

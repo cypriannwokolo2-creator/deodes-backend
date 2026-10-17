@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -36,6 +37,11 @@ type AdminHandler struct {
 	// moderation endpoints (nil-safe: those endpoints report unconfigured).
 	communityService community.Service
 	walletRepo       wallet.Repository
+	// scoreRefresher recomputes DeoScores (nil-safe: recalculate reports
+	// unconfigured when unwired, as in unit tests).
+	scoreRefresher interface {
+		RefreshUser(ctx context.Context, userID string) (int, error)
+	}
 }
 
 func NewAdminHandler(userSvc user.Service, userRepo user.Repository, circleSvc circle.Service, auditRepo audit.Repository, metricsSvc *admin.Service, featureFlagSvc featureflag.Service, flagCache *featureflag.Cache) *AdminHandler {
@@ -280,6 +286,85 @@ func parseAuditLogTime(raw string) (*time.Time, error) {
 		}
 	}
 	return nil, errors.New("must be an RFC3339 timestamp or a YYYY-MM-DD date")
+}
+
+// WithScoreRefresher attaches the DeoScore recomputation pipeline used by
+// the recalculate endpoint. Kept as an option so existing constructors
+// keep working.
+func (h *AdminHandler) WithScoreRefresher(r interface {
+	RefreshUser(ctx context.Context, userID string) (int, error)
+}) *AdminHandler {
+	h.scoreRefresher = r
+	return h
+}
+
+// @Summary [Admin] Recalculate DeoScores
+// @Description Recomputes DeoScore from confirmed contributions for one user (?user_id= or {"user_id"}) or the whole user base. Per-user failures never abort the run; counts are reported. Admin only.
+// @Tags Admin
+// @Accept json
+// @Produce json
+// @Security BearerAuth
+// @Param user_id query string false "Single user ID to refresh (UUID)"
+// @Success 200 {object} response.Envelope{data=object}
+// @Failure 503 {object} response.Envelope
+// @Router /admin/reputation/recalculate [post]
+func (h *AdminHandler) RecalculateScores(c *gin.Context) {
+	if h.scoreRefresher == nil {
+		response.InternalError(c, "score pipeline not configured")
+		return
+	}
+	var body struct {
+		UserID string `json:"user_id"`
+	}
+	_ = c.ShouldBindJSON(&body)
+	target := strings.TrimSpace(c.Query("user_id"))
+	if target == "" {
+		target = strings.TrimSpace(body.UserID)
+	}
+
+	ctx := c.Request.Context()
+	if target != "" {
+		if _, err := uuid.Parse(target); err != nil {
+			response.BadRequest(c, "invalid user ID")
+			return
+		}
+		score, err := h.scoreRefresher.RefreshUser(ctx, target)
+		if err != nil {
+			response.InternalError(c, "failed to refresh score")
+			return
+		}
+		h.auditAdmin(c, "admin.reputation.recalculate", "user", target, map[string]any{"score": score})
+		response.OK(c, gin.H{"user_id": target, "score": score, "updated": 1, "failed": 0})
+		return
+	}
+
+	// userRepo.List clamps pages to 100 rows; keep pageSize at the cap so
+	// the trailing-page check below terminates the walk correctly.
+	const pageSize = 100
+	updated, failed := 0, 0
+	for page := 1; ; page++ {
+		users, err := h.userRepo.List(ctx, user.UserFilter{Page: page, Limit: pageSize})
+		if err != nil {
+			response.InternalError(c, "failed to list users")
+			return
+		}
+		if len(users) == 0 {
+			break
+		}
+		for i := range users {
+			if _, err := h.scoreRefresher.RefreshUser(ctx, users[i].ID.String()); err != nil {
+				failed++
+				log.Warn().Err(err).Str("userId", users[i].ID.String()).Msg("admin score recalculation failed for user")
+				continue
+			}
+			updated++
+		}
+		if len(users) < pageSize {
+			break
+		}
+	}
+	h.auditAdmin(c, "admin.reputation.recalculate", "user", "", map[string]any{"updated": updated, "failed": failed})
+	response.OK(c, gin.H{"updated": updated, "failed": failed})
 }
 
 // @Summary [Admin] Get system metrics

@@ -2,6 +2,7 @@ package mocks
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/mock"
@@ -71,4 +72,13 @@ func (m *Repository) ListByCircle(ctx context.Context, circleID uuid.UUID, page,
 		return nil, args.Int(1), args.Error(2)
 	}
 	return args.Get(0).([]contribution.Contribution), args.Int(1), args.Error(2)
+}
+
+func (m *Repository) StatsByUser(ctx context.Context, userID uuid.UUID) (float64, *time.Time, error) {
+	args := m.Called(ctx, userID)
+	var lastAt *time.Time
+	if args.Get(1) != nil {
+		lastAt = args.Get(1).(*time.Time)
+	}
+	return args.Get(0).(float64), lastAt, args.Error(2)
 }

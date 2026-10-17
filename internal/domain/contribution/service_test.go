@@ -194,6 +194,9 @@ func TestContributionService_UpdateVerification(t *testing.T) {
 	contribID := uuid.New()
 
 	repo.On("UpdateVerificationStatus", ctx, contribID, true, contribution.VerificationStatusVerified).Return(nil)
+	// Post-confirmation score refresh reloads the row (nil updater here,
+	// so the lookup result is only used for the user ID).
+	repo.On("FindByID", ctx, contribID).Return(&contribution.Contribution{ID: contribID, UserID: uuid.New()}, nil)
 
 	err := svc.UpdateVerification(ctx, contribID.String(), true, contribution.VerificationStatusVerified)
 	assert.NoError(t, err)

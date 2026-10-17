@@ -57,6 +57,13 @@ type Service interface {
 	UpdateVerification(ctx context.Context, id string, verifiedOnchain bool, status VerificationStatus) error
 }
 
+// ScoreUpdater refreshes a user's reputation after a confirmed
+// contribution. Implementations must be best-effort safe: the service logs
+// and swallows their errors so scoring can never fail a contribution.
+type ScoreUpdater interface {
+	RefreshScore(ctx context.Context, userID string) error
+}
+
 // ServiceWithCircle adds circle service for membership/round validation.
 type ServiceWithCircle interface {
 	Service
@@ -68,6 +75,9 @@ type ServiceWithCircle interface {
 	// SetTxVerifier wires record-time on-chain verification (2.1).
 	// Nil clears it (pending semantics, indexer settles later).
 	SetTxVerifier(v TxVerifier)
+	// SetScoreUpdater wires post-confirmation reputation refresh.
+	// Nil disables it (scores stay frozen, as before).
+	SetScoreUpdater(u ScoreUpdater)
 }
 
 // TxVerifier is the minimal Arc receipt surface for record-time on-chain
@@ -92,12 +102,29 @@ type service struct {
 	tx            Transactor
 	payoutChecker PayoutScheduleChecker
 	circleService circle.Service
+	scoreUpdater  ScoreUpdater
 	// arcCircleAddress is cfg.Arc.CircleAddress: the canonical circle
 	// contract Record resolves against. Empty means unwired (dev).
 	arcCircleAddress string
 	// verifier, when set, settles on-chain verification at record time
 	// (2.1). Nil keeps pending semantics; the indexer settles later.
 	verifier TxVerifier
+}
+
+// SetScoreUpdater wires post-confirmation reputation refresh (nil disables).
+func (s *service) SetScoreUpdater(u ScoreUpdater) {
+	s.scoreUpdater = u
+}
+
+// refreshScore notifies the reputation pipeline best-effort: a scoring
+// failure is logged and never fails the contribution that triggered it.
+func (s *service) refreshScore(ctx context.Context, userID string) {
+	if s.scoreUpdater == nil {
+		return
+	}
+	if err := s.scoreUpdater.RefreshScore(ctx, userID); err != nil {
+		log.Warn().Err(err).Str("userID", userID).Msg("reputation refresh failed after contribution")
+	}
 }
 
 // SetPayoutChecker sets the payout schedule checker on the contribution service.
@@ -416,6 +443,12 @@ func (s *service) Record(ctx context.Context, input RecordInput) (*Contribution,
 		s.broadcaster.ContributionRecorded(ctx, input.CircleID, input.UserID, input.RoundNumber, input.Amount)
 	}
 
+	// Confirmed money moves the score: pending rows settle later through
+	// UpdateVerification, which refreshes on the verified transition.
+	if verifiedOnchain {
+		s.refreshScore(ctx, input.UserID)
+	}
+
 	return c, nil
 }
 
@@ -440,5 +473,17 @@ func (s *service) UpdateVerification(ctx context.Context, id string, verifiedOnc
 	if err != nil {
 		return fmt.Errorf("invalid contribution ID: %w", err)
 	}
-	return s.repo.UpdateVerificationStatus(ctx, uid, verifiedOnchain, status)
+	if err := s.repo.UpdateVerificationStatus(ctx, uid, verifiedOnchain, status); err != nil {
+		return err
+	}
+	// Late settlement (indexer or verifier): the row just became confirmed
+	// money, so refresh the contributor's score best-effort.
+	if verifiedOnchain && status == VerificationStatusVerified {
+		if c, err := s.repo.FindByID(ctx, uid); err == nil && c != nil {
+			s.refreshScore(ctx, c.UserID.String())
+		} else if err != nil {
+			log.Warn().Err(err).Str("contributionID", id).Msg("score refresh skipped: contribution reload failed")
+		}
+	}
+	return nil
 }

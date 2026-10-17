@@ -502,6 +502,7 @@ func NewRouter(
 			admin.PATCH("/support-tickets/:id", supportHandler.UpdateTicket)
 			admin.GET("/audit-log", adminHandler.GetAuditLog)
 			admin.GET("/metrics", adminHandler.GetMetrics)
+			admin.POST("/reputation/recalculate", adminHandler.RecalculateScores)
 			admin.GET("/feature-flags", adminHandler.ListFeatureFlags)
 			admin.GET("/feature-flags/:flag", adminHandler.GetFeatureFlag)
 			admin.POST("/feature-flags", adminHandler.UpdateFeatureFlag)

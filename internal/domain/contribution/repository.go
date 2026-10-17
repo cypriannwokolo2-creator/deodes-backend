@@ -2,6 +2,7 @@ package contribution
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -18,4 +19,7 @@ type Repository interface {
 	UpdateVerificationStatus(ctx context.Context, id uuid.UUID, verifiedOnchain bool, status VerificationStatus) error
 	ListByUser(ctx context.Context, userID uuid.UUID, page, limit int) ([]Contribution, int, error)
 	ListByCircle(ctx context.Context, circleID uuid.UUID, page, limit int) ([]Contribution, int, error)
+	// StatsByUser aggregates confirmed-contribution volume and recency for
+	// reputation scoring. Unconfirmed (pending) rows never move the score.
+	StatsByUser(ctx context.Context, userID uuid.UUID) (volume float64, lastAt *time.Time, err error)
 }

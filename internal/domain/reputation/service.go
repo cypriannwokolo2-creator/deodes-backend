@@ -13,6 +13,9 @@ import (
 type Service interface {
 	CalculateScore(ctx context.Context, userID string, consecutiveStreaks int, completedCircles int, totalVolumeUSD float64, daysSinceLast int) (*ReputationSnapshot, error)
 	UpdateScore(ctx context.Context, userID string, consecutiveStreaks int, completedCircles int, totalVolumeUSD float64, daysSinceLast int) (*ReputationSnapshot, error)
+	// LatestScore returns the newest stored snapshot, or ErrNotFound when
+	// the user has never had a score persisted.
+	LatestScore(ctx context.Context, userID string) (*ReputationSnapshot, error)
 	TopScores(ctx context.Context, limit int) ([]LeaderboardEntry, error)
 }
 
@@ -84,6 +87,15 @@ func (s *reputationService) UpdateScore(ctx context.Context, userID string, cons
 	}
 
 	return snapshot, nil
+}
+
+// LatestScore returns the newest stored snapshot without recomputing.
+func (s *reputationService) LatestScore(ctx context.Context, userID string) (*ReputationSnapshot, error) {
+	uid, err := parseUUID(userID)
+	if err != nil {
+		return nil, err
+	}
+	return s.repo.GetByUser(ctx, uid)
 }
 
 func (s *reputationService) TopScores(ctx context.Context, limit int) ([]LeaderboardEntry, error) {

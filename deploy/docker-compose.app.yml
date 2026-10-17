@@ -51,6 +51,7 @@ services:
     image: deodes-frontend:prod
     container_name: deodes-frontend
     network_mode: host
+    restart: unless-stopped
     env_file:
       - /root/DEODES/.env.production.local
       - /root/DEODES/.env.local
