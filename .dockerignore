@@ -1,0 +1,8 @@
+# Never bake secrets or host artifacts into images.
+.env
+.env.*
+*.local
+bin/
+tmp*/
+.git/
+docs/

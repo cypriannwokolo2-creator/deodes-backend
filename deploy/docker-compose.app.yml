@@ -1,0 +1,73 @@
+# Deodes application stack (api + frontend) on Docker.
+#
+# Design: zero traefik changes. Both services publish the SAME loopback
+# ports the systemd units bind today (1100/1110), so edge routing is
+# untouched. Data stays where it is: the existing deodes-deps postgres /
+# redis / rabbitmq on the host, reached via host.docker.internal (see
+# gen-app-env.sh). Live backend config is mounted over the baked one.
+# Rollback: `docker compose -f <this> down` + `systemctl start deodes-api
+# deodes-frontend` (units are left disabled-but-present, binaries kept).
+services:
+  deodes-api:
+    build:
+      context: /root/deodes-backend
+      dockerfile: Dockerfile
+    image: deodes-api:prod
+    container_name: deodes-api
+    network_mode: host
+    env_file:
+      - /root/deodes-backend/.env
+    volumes:
+      - /root/deodes-backend/config/config.yaml:/etc/deodes/config.yaml:ro
+      - /root/deodes-backend/config/keys:/config/keys:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:1100/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  deodes-frontend:
+    build:
+      context: /root/DEODES
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
+        NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL}
+        NEXT_PUBLIC_ARC_CHAIN_ID: ${NEXT_PUBLIC_ARC_CHAIN_ID}
+        NEXT_PUBLIC_ARC_EXPLORER_URL: ${NEXT_PUBLIC_ARC_EXPLORER_URL}
+        NEXT_PUBLIC_ARC_NETWORK: ${NEXT_PUBLIC_ARC_NETWORK}
+        NEXT_PUBLIC_ARC_RPC_URL: ${NEXT_PUBLIC_ARC_RPC_URL}
+        NEXT_PUBLIC_DEODES_CONTRACT_ID: ${NEXT_PUBLIC_DEODES_CONTRACT_ID}
+        NEXT_PUBLIC_ONRAMP_ENABLED: ${NEXT_PUBLIC_ONRAMP_ENABLED}
+        NEXT_PUBLIC_PASSKEY_RP_ID: ${NEXT_PUBLIC_PASSKEY_RP_ID}
+        NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL}
+    image: deodes-frontend:prod
+    container_name: deodes-frontend
+    network_mode: host
+    env_file:
+      - /root/DEODES/.env.production.local
+      - /root/DEODES/.env.local
+    environment:
+      NODE_ENV: production
+      NEXT_PUBLIC_APP_URL: https://deodes.com
+    depends_on:
+      deodes-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:1110/').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))\""]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
