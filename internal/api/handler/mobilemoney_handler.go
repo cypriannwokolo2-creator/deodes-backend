@@ -75,12 +75,22 @@ func (h *MobileMoneyHandler) InitiateOnramp(c *gin.Context) {
 		response.BadRequest(c, "no wallet found. Create a wallet first.")
 		return
 	}
+	// Prefer the hosted Arc wallet like every other rail: wallets[0] is
+	// merely the primary row, which can be a legacy non-0x wallet while a
+	// hosted address exists further down the list.
+	destination := wallets[0].PublicKey
+	for _, w := range wallets {
+		if w.WalletType == wallet.WalletTypeHosted && strings.HasPrefix(w.PublicKey, "0x") {
+			destination = w.PublicKey
+			break
+		}
+	}
 
 	txn, err := h.svc.InitiateOnramp(ctx, userID, mobilemoney.OnrampRequest{
 		Amount:             req.Amount,
 		Currency:           req.Currency,
 		PhoneNumber:        req.PhoneNumber,
-		DestinationAddress: wallets[0].PublicKey,
+		DestinationAddress: destination,
 		Reference:          idempotencyKey,
 	}, idempotencyKey)
 	if err != nil {

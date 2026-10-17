@@ -33,6 +33,8 @@ var csrfExemptRoutes = map[string]string{
 	"POST /v1/auth/refresh":         "exchanges a refresh token for a new session",
 	"POST /v1/auth/nonce":           "pre-auth wallet challenge",
 	"POST /v1/auth/verify":          "pre-auth wallet signature login; creates the session",
+	"POST /v1/auth/password/forgot": "pre-auth OTP send; no session exists yet (same class as register)",
+	"POST /v1/auth/password/reset":  "pre-auth OTP verify + rotation; no session exists yet (same class as register/verify)",
 	"POST /v1/claim-name":           "anonymous, not user-bound (allocates the next generated name)",
 }
 
@@ -87,6 +89,12 @@ func newCSRFTestRouter(t *testing.T, mutate ...func(*config.Config)) (*gin.Engin
 	// middleware/rate_limit_test.go, not by route-table tests.
 	cfg.RateLimit.OTPLimit = 1_000_000
 	cfg.RateLimit.OTPWindowSeconds = 3600
+	cfg.RateLimit.OTPSendLimit = 1_000_000
+	cfg.RateLimit.OTPSendWindowSeconds = 3600
+	cfg.RateLimit.OTPVerifyLimit = 1_000_000
+	cfg.RateLimit.OTPVerifyWindowSeconds = 3600
+	cfg.RateLimit.LoginLimit = 1_000_000
+	cfg.RateLimit.LoginWindowSeconds = 3600
 	cfg.RateLimit.SwapLimit = 1_000_000
 	cfg.RateLimit.SwapWindowSeconds = 3600
 	cfg.RateLimit.ContributeLimit = 1_000_000
@@ -111,10 +119,11 @@ func newCSRFTestRouter(t *testing.T, mutate ...func(*config.Config)) (*gin.Engin
 		&handler.HealthHandler{}, &handler.PasskeyCredentialHandler{}, &handler.WalletHandler{},
 		&handler.MobileMoneyHandler{}, &handler.ChatHandler{},
 		&handler.CommunityHandler{}, &handler.WebSocketHandler{}, &handler.SavingsGoalHandler{},
+		&handler.BankAccountHandler{},
 		&handler.SwapHandler{}, &handler.GovernanceHandler{},
 		&handler.ReputationHandler{}, &handler.ReferralHandler{}, &handler.ConsentHandler{},
 		&handler.SubscriptionHandler{},
-		&handler.AdminJobQueueHandler{}, nil,
+		&handler.AdminJobQueueHandler{}, &handler.SupportHandler{}, nil,
 		pubPEM,
 	)
 	return r, token

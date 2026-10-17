@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"strings"
+
 	"github.com/gin-gonic/gin"
 	"github.com/deodes/backend/internal/api/middleware"
 	"github.com/deodes/backend/internal/domain/community"
@@ -120,7 +122,13 @@ func (h *CommunityHandler) Leave(c *gin.Context) {
 
 func (h *CommunityHandler) GetMembers(c *gin.Context) {
 	communityID := c.Param("id")
-	members, err := h.communitySvc.GetMembers(c.Request.Context(), communityID)
+	var members []community.CommunityMember
+	var err error
+	if search := strings.TrimSpace(c.Query("search")); search != "" {
+		members, err = h.communitySvc.SearchMembers(c.Request.Context(), communityID, search)
+	} else {
+		members, err = h.communitySvc.GetMembers(c.Request.Context(), communityID)
+	}
 	if err != nil {
 		response.InternalError(c, "failed to get members")
 		return

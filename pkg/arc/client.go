@@ -230,11 +230,17 @@ func (c *Client) EstimateGas(ctx context.Context, from, to string, data []byte) 
 	return v.Uint64(), nil
 }
 
-// LatestBaseFee reads the pending block's baseFeePerGas.
+// LatestBaseFee reads the pending block's baseFeePerGas. Some Arc RPC
+// endpoints do not serve pending-block data and answer -32014 "requested data
+// not available"; fall back to latest, which is equally valid for fee
+// estimation (QuoteFees doubles it and enforces a floor on top).
 func (c *Client) LatestBaseFee(ctx context.Context) (*big.Int, error) {
 	raw, err := c.call(ctx, "eth_getBlockByNumber", "pending", false)
 	if err != nil {
-		return nil, err
+		raw, err = c.call(ctx, "eth_getBlockByNumber", "latest", false)
+		if err != nil {
+			return nil, err
+		}
 	}
 	var block struct {
 		BaseFeePerGas string `json:"baseFeePerGas"`

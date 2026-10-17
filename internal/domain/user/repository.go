@@ -16,6 +16,7 @@ type Repository interface {
 	FindByID(ctx context.Context, id uuid.UUID) (*User, error)
 	FindByWalletAddress(ctx context.Context, walletAddress string) (*User, error)
 	FindByEmail(ctx context.Context, email string) (*User, error)
+	FindByUsername(ctx context.Context, username string) (*User, error)
 	FindByPasskeyCredentialID(ctx context.Context, credentialID string) (*User, error)
 	Create(ctx context.Context, u *User) error
 	Delete(ctx context.Context, id uuid.UUID) error

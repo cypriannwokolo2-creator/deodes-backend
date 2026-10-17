@@ -30,6 +30,7 @@ import (
 	"github.com/deodes/backend/internal/domain/audit"
 	"github.com/deodes/backend/internal/domain/auth"
 	"github.com/deodes/backend/internal/domain/auth/session"
+	"github.com/deodes/backend/internal/domain/bankaccount"
 	"github.com/deodes/backend/internal/domain/chat"
 	"github.com/deodes/backend/internal/domain/circle"
 	"github.com/deodes/backend/internal/domain/community"
@@ -47,6 +48,7 @@ import (
 	"github.com/deodes/backend/internal/domain/savings"
 	"github.com/deodes/backend/internal/domain/sms"
 	"github.com/deodes/backend/internal/domain/subscription"
+	"github.com/deodes/backend/internal/domain/support"
 	"github.com/deodes/backend/internal/domain/swap"
 	"github.com/deodes/backend/internal/domain/totp"
 	"github.com/deodes/backend/internal/domain/user"
@@ -77,6 +79,20 @@ func (a *moiAdapter) FindByID(ctx context.Context, id uuid.UUID) (*circle.UserMO
 		return nil, err
 	}
 	return &circle.UserMOIData{MoiScore: u.MoiScore}, nil
+}
+
+// walletBalanceAdapter feeds the circle funds gate from the wallet service
+// through the narrow BalanceChecker interface (no domain import cycle).
+type walletBalanceAdapter struct {
+	svc wallet.Service
+}
+
+func (a *walletBalanceAdapter) GetBalance(ctx context.Context, userID string) (float64, error) {
+	bal, err := a.svc.GetBalance(ctx, userID)
+	if err != nil {
+		return 0, err
+	}
+	return bal.USDC, nil
 }
 
 // payoutWalletAdapter satisfies payout.WalletLookup by resolving a user's
@@ -286,10 +302,35 @@ func main() {
 	wsBridge := ws.NewRedisBridge(wsHub, redisClient)
 
 	userSvc := user.NewService(userRepo, circleRepo)
+	// Wallet service is built before the circle service so circles can gate
+	// creation/joining on funded wallets (no import cycle: the gate is a
+	// narrow float64 interface). Declared up here; the auth handler still
+	// consumes walletSvc below as before.
+	walletCfg := wallet.Config{
+		// Deterministic seed derivation for email-based wallets (#166).
+		WalletPepper:  cfg.Security.WalletPepper,
+		Argon2Time:    cfg.Security.Argon2Time,
+		Argon2Memory:  cfg.Security.Argon2Memory,
+		Argon2Threads: cfg.Security.Argon2Threads,
+		// Custodial hosted Arc wallets encrypt secrets with this key.
+		EncryptionKey: cfg.Security.EncryptionKey,
+		// Arc chain settings for hosted 0x balance reads and sends.
+		ArcRPCURL:       cfg.Arc.RPCURL,
+		ArcChainID:      cfg.Arc.ChainID,
+		ArcUSDCContract: cfg.Arc.USDCContract,
+		// Daily value cap on custodial sends (C2).
+		DailySendLimitUSD: cfg.Transfer.DailyLimitUSD,
+	}
+	walletRepo := wallet.NewRepository(db)
+	walletSvc, err := wallet.NewService(walletRepo, walletCfg)
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to initialize wallet service")
+	}
 	circleSvc := circle.NewService(circleRepo, &moiAdapter{repo: userRepo}, circle.Dependencies{
 		CommunityChecker: &communityAdapter{repo: communityRepo},
 		Broadcaster:      wsBroadcaster,
 		Transactor:       circle.NewTransactor(db),
+		BalanceChecker:   &walletBalanceAdapter{svc: walletSvc},
 	})
 	contribSvc := contribution.NewService(contribRepo, wsBroadcaster, contribution.NewTransactor(db), circleSvc)
 	payoutSvc := payout.NewService(payoutRepo, &payoutWalletAdapter{repo: userRepo}, circleSvc)
@@ -306,6 +347,23 @@ func main() {
 		if err := pwc.SetArcCircleAddress(cfg.Arc.CircleAddress); err != nil {
 			log.Fatal().Err(err).Msg("invalid arc.circle_address for payout service")
 		}
+	}
+
+	// Phase 2.1: record-time receipt verification for contributions/payouts.
+	// Wired whenever an RPC URL is configured (independent of the 2.6 indexer
+	// below): confirmed receipts settle immediately, reverted/wrong-contract
+	// receipts are rejected, RPC flakes stay pending for the indexer.
+	if strings.TrimSpace(cfg.Arc.RPCURL) != "" {
+		verifyClient := arc.NewClient(cfg.Arc.RPCURL, cfg.Arc.ChainID)
+		if cwc, ok := contribSvc.(contribution.ServiceWithCircle); ok {
+			cwc.SetTxVerifier(verifyClient)
+		}
+		if pwc, ok := payoutSvc.(payout.ServiceWithCircle); ok {
+			pwc.SetTxVerifier(verifyClient)
+		}
+		log.Info().Msg("record-time tx verification enabled (contribution/payout)")
+	} else {
+		log.Info().Msg("record-time tx verification disabled (arc.rpc_url unset; pending semantics)")
 	}
 
 	// Phase 2.6: Arc event indexer. Tails DeodesCircle logs (backfill +
@@ -369,12 +427,27 @@ func main() {
 	sessionCleaner.Start(context.Background())
 
 	totpSvc := totp.NewService()
-	verificationSvc := verification.NewService(redisClient)
+	verificationSvc := verification.NewService(redisClient).WithPepper(cfg.Security.WalletPepper)
 	emailSvc := email.NewService(email.Config{
-		APIKey:      cfg.Brevo.APIKey,
-		FromAddress: cfg.Brevo.FromEmail,
-		FromName:    cfg.Brevo.FromName,
+		APIKey:           cfg.Brevo.APIKey,
+		FromAddress:      cfg.Brevo.FromEmail,
+		FromName:         cfg.Brevo.FromName,
+		TempSenderNotice: cfg.Brevo.TempSenderNotice,
 	})
+	// Warn-only sender check: a From address that Brevo does not know fails
+	// every send with a 4xx. Brevo downtime must never block API boot, so a
+	// failed check logs an ERROR with the fix and continues.
+	if strings.TrimSpace(cfg.Brevo.APIKey) != "" {
+		vctx, vcancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if verr := emailSvc.VerifySender(vctx); verr != nil {
+			log.Error().Err(verr).Msg("brevo sender check failed — emails will likely 4xx until the sender domain is verified")
+		} else {
+			log.Info().Str("from", cfg.Brevo.FromEmail).Msg("brevo sender verified")
+		}
+		vcancel()
+	} else {
+		log.Warn().Msg("brevo API key unset — OTP emails are skipped in dev mode (users will never receive codes)")
+	}
 
 	// Notification delivery channels (#191): email reuses the same Brevo
 	// client already used for OTP/backup-code/recovery emails; SMS/push are
@@ -408,24 +481,8 @@ func main() {
 	inviteSvc := invite.NewService(inviteRepo)
 	_ = auditRepo
 
-	// Wallet service (needed before auth handler for wallet creation)
-	walletCfg := wallet.Config{
-		// Deterministic seed derivation for email-based wallets (#166).
-		WalletPepper:  cfg.Security.WalletPepper,
-		Argon2Time:    cfg.Security.Argon2Time,
-		Argon2Memory:  cfg.Security.Argon2Memory,
-		Argon2Threads: cfg.Security.Argon2Threads,
-		// Custodial hosted Arc wallets encrypt secrets with this key.
-		EncryptionKey: cfg.Security.EncryptionKey,
-		// Arc chain settings for hosted 0x balance reads and sends.
-		ArcRPCURL:       cfg.Arc.RPCURL,
-		ArcChainID:      cfg.Arc.ChainID,
-		ArcUSDCContract: cfg.Arc.USDCContract,
-	}
-	walletSvc, err := wallet.NewService(wallet.NewRepository(db), walletCfg)
-	if err != nil {
-		log.Fatal().Err(err).Msg("failed to initialize wallet service")
-	}
+	// Wallet service is initialized above (before the circle service) so the
+	// funds gate can use it.
 
 	jwtPublicKey := []byte(cfg.Auth.JWTPublicKeyPEM)
 
@@ -450,16 +507,16 @@ func main() {
 	if err := featureFlagCache.Start(context.Background()); err != nil {
 		log.Warn().Err(err).Msg("failed to load feature flags on startup — cache starts empty until the next reload")
 	}
-	adminH := handler.NewAdminHandler(userSvc, userRepo, circleSvc, auditRepo, adminSvc, featureFlagSvc, featureFlagCache)
+	communitySvc := community.NewService(communityRepo, wsBroadcaster)
+	communityH := handler.NewCommunityHandler(communitySvc)
+	adminH := handler.NewAdminHandler(userSvc, userRepo, circleSvc, auditRepo, adminSvc, featureFlagSvc, featureFlagCache).
+		WithCommunityService(communitySvc).
+		WithWalletRepository(walletRepo)
 	webhookRepo := webhook.NewPostgresRepository(db.DB)
 	webhookH := handler.NewWebhookHandler(webhookRepo)
 	healthH := handler.NewHealthHandler(db.DB, redisClient)
 	passkeyCredH := handler.NewPasskeyCredentialHandler(db)
-	walletH := handler.NewWalletHandler(walletSvc, authSvc)
-
-	// Community service
-	communitySvc := community.NewService(communityRepo, wsBroadcaster)
-	communityH := handler.NewCommunityHandler(communitySvc)
+	walletH := handler.NewWalletHandler(walletSvc, authSvc).WithUserRepository(userRepo).WithWalletRepository(walletRepo).WithNotificationService(notificationSvc)
 
 	// Fiat ramp (Yellow Card) removed — local-currency deposits are coming
 	// soon. Re-add the ramp wiring here when a provider is chosen; the
@@ -547,6 +604,17 @@ func main() {
 	savingsRepo := savings.NewRepository(db)
 	savingsSvc := savings.NewService(savingsRepo)
 	savingsH := handler.NewSavingsGoalHandler(savingsSvc)
+
+	// Auto-save keeper: tops up due goal allocations on a tick (15m). Uses
+	// the same wallet balance adapter as the circle funds gate; atomic
+	// last_auto_at claims make concurrent replicas safe.
+	savingsKeeper := savings.NewKeeper(savingsRepo, &walletBalanceAdapter{svc: walletSvc}, redisClient, 15*time.Minute)
+	savingsKeeper.Start(context.Background())
+
+	// Saved fiat payout rails (payment settings screen).
+	bankAccountRepo := bankaccount.NewRepository(db)
+	bankAccountSvc := bankaccount.NewService(bankAccountRepo)
+	bankAccountH := handler.NewBankAccountHandler(bankAccountSvc)
 
 	// Swap escrow is on-chain (purged): no escrow client exists, so
 	// the swap service gets an untyped nil and fails fast per call
@@ -644,6 +712,9 @@ func main() {
 	// GDPR cookie consent handler
 	consentH := handler.NewConsentHandler(db.DB)
 
+	// Contact-form inbox: public writes, admin triage.
+	supportH := handler.NewSupportHandler(support.NewService(support.NewRepository(db)), auditRepo)
+
 	// Auto-debit subscriptions share the keeper's repository.
 	subscriptionH := handler.NewSubscriptionHandler(subscription.NewRepository(db), circleSvc)
 
@@ -663,7 +734,7 @@ func main() {
 	jobQueue := jobqueue.NewJobQueue(db)
 	adminJobQueueH := handler.NewAdminJobQueueHandler(jobQueue)
 
-	router := api.NewRouter(cfg, redisClient, authH, userH, circleH, contribH, payoutH, inviteH, notifH, adminH, webhookH, healthH, passkeyCredH, walletH, mobileMoneyH, chatH, communityH, wsH, savingsH, swapH, governanceH, reputationH, referralH, consentH, subscriptionH, adminJobQueueH, webhookRepo, jwtPublicKey)
+	router := api.NewRouter(cfg, redisClient, authH, userH, circleH, contribH, payoutH, inviteH, notifH, adminH, webhookH, healthH, passkeyCredH, walletH, mobileMoneyH, chatH, communityH, wsH, savingsH, bankAccountH, swapH, governanceH, reputationH, referralH, consentH, subscriptionH, adminJobQueueH, supportH, webhookRepo, jwtPublicKey)
 
 	// Shutdown order: fail readiness first so the load balancer stops sending
 	// traffic, drain in-flight HTTP requests (bounded by
@@ -685,6 +756,7 @@ func main() {
 			},
 			func(context.Context) { digestFlusher.Stop() },
 			func(context.Context) { swapSweeper.Stop() },
+			func(context.Context) { savingsKeeper.Stop() },
 			func(context.Context) {
 				if keeperLoop != nil {
 					keeperLoop.Stop()

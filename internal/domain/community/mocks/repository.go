@@ -46,6 +46,14 @@ func (m *Repository) Delete(ctx context.Context, id uuid.UUID) error {
 	return m.Called(ctx, id).Error(0)
 }
 
+func (m *Repository) Suspend(ctx context.Context, id uuid.UUID, reason string) error {
+	return m.Called(ctx, id, reason).Error(0)
+}
+
+func (m *Repository) Unsuspend(ctx context.Context, id uuid.UUID) error {
+	return m.Called(ctx, id).Error(0)
+}
+
 func (m *Repository) AddMember(ctx context.Context, mm *community.CommunityMember) error {
 	return m.Called(ctx, mm).Error(0)
 }
@@ -60,6 +68,14 @@ func (m *Repository) UpdateMemberRole(ctx context.Context, communityID, userID u
 
 func (m *Repository) GetMembers(ctx context.Context, communityID uuid.UUID) ([]community.CommunityMember, error) {
 	args := m.Called(ctx, communityID)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]community.CommunityMember), args.Error(1)
+}
+
+func (m *Repository) SearchMembers(ctx context.Context, communityID uuid.UUID, search string) ([]community.CommunityMember, error) {
+	args := m.Called(ctx, communityID, search)
 	if args.Get(0) == nil {
 		return nil, args.Error(1)
 	}

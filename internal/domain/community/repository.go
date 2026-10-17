@@ -13,11 +13,16 @@ type Repository interface {
 	List(ctx context.Context, filter CommunityFilter) ([]Community, int, error)
 	Update(ctx context.Context, c *Community) error
 	Delete(ctx context.Context, id uuid.UUID) error
+	// Suspend freezes a community (hidden from listing, no joins/edits/circles)
+	// with a reason; Unsuspend clears it. Admin moderation only.
+	Suspend(ctx context.Context, id uuid.UUID, reason string) error
+	Unsuspend(ctx context.Context, id uuid.UUID) error
 
 	AddMember(ctx context.Context, m *CommunityMember) error
 	RemoveMember(ctx context.Context, communityID, userID uuid.UUID) error
 	UpdateMemberRole(ctx context.Context, communityID, userID uuid.UUID, role string) error
 	GetMembers(ctx context.Context, communityID uuid.UUID) ([]CommunityMember, error)
+	SearchMembers(ctx context.Context, communityID uuid.UUID, search string) ([]CommunityMember, error)
 	IsMember(ctx context.Context, communityID, userID uuid.UUID) (bool, error)
 	GetMemberCount(ctx context.Context, communityID uuid.UUID) (int, error)
 
@@ -41,4 +46,6 @@ type CommunityFilter struct {
 	Category string
 	Page     int
 	Limit    int
+	// IncludeSuspended shows admin-moderated rows; public listing excludes them.
+	IncludeSuspended bool
 }

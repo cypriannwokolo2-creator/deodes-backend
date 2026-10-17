@@ -21,6 +21,7 @@ type User struct {
 	ID                   uuid.UUID      `json:"id" db:"id"`
 	WalletAddress        string         `json:"walletAddress" db:"wallet_address"`
 	Email                *string        `json:"email,omitempty" db:"email"`
+	Username             *string        `json:"username,omitempty" db:"username"`
 	Phone                *string        `json:"phone,omitempty" db:"phone"`
 	DisplayName          *string        `json:"displayName,omitempty" db:"display_name"`
 	AvatarIpfsHash       *string        `json:"avatarIpfsHash,omitempty" db:"avatar_ipfs_hash"`
@@ -37,6 +38,14 @@ type User struct {
 	PasskeyCredentialID  *string        `json:"passkeyCredentialId,omitempty" db:"passkey_credential_id"`
 	NotificationChannels pq.StringArray `json:"notificationChannels" db:"notification_channels"`
 	NotificationsMuted   bool           `json:"notificationsMuted" db:"notifications_muted"`
+	// Savings + currency preferences (061): backing storage for the settings
+	// screens, written via PATCH /users/me like the digest prefs (049).
+	SavingsAutoReserve       bool    `json:"savingsAutoReserve" db:"savings_auto_reserve"`
+	SavingsDefaultTarget     float64 `json:"savingsDefaultTarget" db:"savings_default_target"`
+	SavingsDefaultFrequency  string  `json:"savingsDefaultFrequency" db:"savings_default_frequency"`
+	SavingsNotifyOnMilestone bool    `json:"savingsNotifyOnMilestone" db:"savings_notify_on_milestone"`
+	SavingsMilestoneThreshold int    `json:"savingsMilestoneThreshold" db:"savings_milestone_threshold"`
+	PreferredCurrency        string  `json:"preferredCurrency" db:"preferred_currency"`
 	// DigestEnabled turns digest batching on for this user (#415). When true,
 	// non-urgent circle events are collapsed into a periodic summary instead of
 	// being delivered one by one. Urgent classes (payout, dispute, completed

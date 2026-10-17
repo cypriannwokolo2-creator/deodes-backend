@@ -19,6 +19,14 @@ const (
 	TypeCircleCompleted      NotificationType = "circle.completed"
 	TypeMemberExited         NotificationType = "member.exited"
 	TypeDisputeRaised        NotificationType = "dispute.raised"
+	// Wallet transfer outcomes, reported by the sender's client once the
+	// receipt settles (see WalletHandler.ReportTransferOutcome). Stored with
+	// underscores (transfer_confirmed, ...) like every other type: the
+	// repository normalizes on write and the frontend keys its icons off
+	// the stored form.
+	TypeTransferConfirmed NotificationType = "transfer.confirmed"
+	TypeTransferFailed    NotificationType = "transfer.failed"
+	TypeTransferReceived  NotificationType = "transfer.received"
 )
 
 type NotificationChannel string

@@ -23,7 +23,7 @@ func setupSwapTestRouter(swapSvc *swap.Service, authUserID string) *gin.Engine {
 	r := gin.New()
 	r.Use(func(c *gin.Context) {
 		if authUserID != "" {
-			c.Set("user_id", authUserID)
+			c.Set("userID", authUserID)
 		}
 		c.Next()
 	})

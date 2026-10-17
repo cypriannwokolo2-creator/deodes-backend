@@ -216,12 +216,20 @@ func (k *Keeper) processOne(ctx context.Context, now time.Time, sub *Subscriptio
 		k.emit(ctx, withReason(base, 0, OutcomeFailed, "getting circle: "+err.Error()))
 		return OutcomeFailed
 	}
-	if cir.Status == circle.CircleStatusCompleted || cir.Status == circle.CircleStatusCancelled {
+	if cir.Status == circle.CircleStatusCompleted || cir.Status == circle.CircleStatusCancelled ||
+		cir.Status == circle.CircleStatusBanned {
 		if err := k.repo.UpdateStatus(ctx, sub.ID, StatusCompleted); err != nil {
 			k.emit(ctx, withReason(base, 0, OutcomeFailed, err.Error()))
 			return OutcomeFailed
 		}
 		k.emit(ctx, withReason(base, 0, OutcomeSkippedCapped, "circle "+string(cir.Status)))
+		return OutcomeSkippedCapped
+	}
+	if cir.Status == circle.CircleStatusPaused {
+		// Pause is temporary: postpone this debit but keep the consent row
+		// so resuming the circle restarts debits cleanly.
+		_ = k.repo.Postpone(ctx, sub.ID, k.nextAfter(now, cir.Frequency))
+		k.emit(ctx, withReason(base, 0, OutcomeSkippedCapped, "circle paused"))
 		return OutcomeSkippedCapped
 	}
 	if !cir.AutoDebit {

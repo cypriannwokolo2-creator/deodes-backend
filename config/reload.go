@@ -45,7 +45,8 @@ func (h *HotReloader) RateLimit() RateLimitConfig {
 }
 
 // Apply validates the whitelisted keys in v (logging.level, rate_limit.global,
-// rate_limit.authenticated, rate_limit.auth) and swaps them in atomically.
+// rate_limit.authenticated, rate_limit.auth, plus the split OTP/login buckets)
+// and swaps them in atomically.
 // Keys absent from v keep their current value. On error nothing changes.
 func (h *HotReloader) Apply(v *viper.Viper) (HotConfig, error) {
 	next := h.Get()
@@ -61,9 +62,23 @@ func (h *HotReloader) Apply(v *viper.Viper) (HotConfig, error) {
 	}
 
 	limits := map[string]*int{
-		"rate_limit.global":        &next.RateLimit.Global,
-		"rate_limit.authenticated": &next.RateLimit.Authenticated,
-		"rate_limit.auth":          &next.RateLimit.Auth,
+		"rate_limit.global":                        &next.RateLimit.Global,
+		"rate_limit.authenticated":                 &next.RateLimit.Authenticated,
+		"rate_limit.auth":                          &next.RateLimit.Auth,
+		"rate_limit.otp_limit":                     &next.RateLimit.OTPLimit,
+		"rate_limit.otp_window_seconds":            &next.RateLimit.OTPWindowSeconds,
+		"rate_limit.otp_send_limit":                &next.RateLimit.OTPSendLimit,
+		"rate_limit.otp_send_window_seconds":       &next.RateLimit.OTPSendWindowSeconds,
+		"rate_limit.otp_verify_limit":              &next.RateLimit.OTPVerifyLimit,
+		"rate_limit.otp_verify_window_seconds":     &next.RateLimit.OTPVerifyWindowSeconds,
+		"rate_limit.login_limit":                   &next.RateLimit.LoginLimit,
+		"rate_limit.login_window_seconds":          &next.RateLimit.LoginWindowSeconds,
+		"rate_limit.invite_preview_limit":          &next.RateLimit.InvitePreviewLimit,
+		"rate_limit.invite_preview_window_seconds": &next.RateLimit.InvitePreviewWindowSeconds,
+		"rate_limit.claim_limit":                   &next.RateLimit.ClaimLimit,
+		"rate_limit.claim_window_seconds":          &next.RateLimit.ClaimWindowSeconds,
+		"rate_limit.consent_limit":                 &next.RateLimit.ConsentLimit,
+		"rate_limit.consent_window_seconds":        &next.RateLimit.ConsentWindowSeconds,
 	}
 	for key, dst := range limits {
 		if !v.IsSet(key) {

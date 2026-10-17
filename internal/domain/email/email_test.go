@@ -111,3 +111,108 @@ func TestEmailService_PermanentFailureWhenRetriesExhausted(t *testing.T) {
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "attempts to send email via brevo failed")
 }
+
+func TestEmailService_TempSenderNoticeFooter(t *testing.T) {
+	var receivedBody map[string]any
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&receivedBody)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"messageId":"<notice123>"}`))
+	}))
+	defer server.Close()
+
+	newSvc := func(notice bool) *email.Service {
+		return email.NewService(email.Config{
+			APIKey:           "test-key",
+			FromAddress:      "admin@codexhange.com",
+			FromName:         "Deodes",
+			BaseURL:          server.URL,
+			TempSenderNotice: notice,
+		})
+	}
+
+	// Flag on: footer names the temp sender and reassures it is Deodes.
+	require.NoError(t, newSvc(true).SendOTP(context.Background(), "u@example.com", "111222"))
+	htmlOn := receivedBody["htmlContent"].(string)
+	assert.Contains(t, htmlOn, "111222")
+	assert.Contains(t, htmlOn, "temporary sender address")
+	assert.Contains(t, htmlOn, "admin@codexhange.com")
+	assert.Contains(t, htmlOn, "still")
+	assert.Contains(t, htmlOn, "Deodes")
+	textOn := receivedBody["textContent"].(string)
+	assert.Contains(t, textOn, "111222")
+	assert.NotContains(t, textOn, "<h2", "text fallback must not contain HTML tags")
+
+	// Flag off: no footer, code still delivered with text fallback.
+	require.NoError(t, newSvc(false).SendOTP(context.Background(), "u@example.com", "333444"))
+	htmlOff := receivedBody["htmlContent"].(string)
+	assert.Contains(t, htmlOff, "333444")
+	assert.NotContains(t, htmlOff, "temporary sender address")
+	assert.Contains(t, receivedBody["textContent"].(string), "333444")
+}
+
+func TestEmailService_SenderRejectionNamesTheFix(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"message":"sender not verified"}`))
+	}))
+	defer server.Close()
+
+	svc := email.NewService(email.Config{
+		APIKey:      "test-key",
+		FromAddress: "noreply@deodes.com",
+		BaseURL:     server.URL,
+	})
+
+	err := svc.SendOTP(context.Background(), "u@example.com", "123456")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "verify the sender domain")
+}
+
+func TestEmailService_VerifySender(t *testing.T) {
+	verifiedPayload := `[{"email":"admin@codexhange.com","active":true},{"email":"other@x.com","active":false}]`
+
+	newServer := func(body string, status int) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, "test-key", r.Header.Get("api-key"))
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(body))
+		}))
+	}
+
+	t.Run("verified sender passes", func(t *testing.T) {
+		srv := newServer(verifiedPayload, http.StatusOK)
+		defer srv.Close()
+		svc := email.NewService(email.Config{APIKey: "test-key", FromAddress: "admin@codexhange.com", BaseURL: srv.URL})
+		assert.NoError(t, svc.VerifySender(context.Background()))
+	})
+
+	t.Run("unverified sender fails with the fix", func(t *testing.T) {
+		srv := newServer(verifiedPayload, http.StatusOK)
+		defer srv.Close()
+		svc := email.NewService(email.Config{APIKey: "test-key", FromAddress: "noreply@deodes.com", BaseURL: srv.URL})
+		err := svc.VerifySender(context.Background())
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "not an active verified sender")
+	})
+
+	t.Run("inactive sender fails", func(t *testing.T) {
+		srv := newServer(verifiedPayload, http.StatusOK)
+		defer srv.Close()
+		svc := email.NewService(email.Config{APIKey: "test-key", FromAddress: "other@x.com", BaseURL: srv.URL})
+		require.Error(t, svc.VerifySender(context.Background()))
+	})
+
+	t.Run("server error surfaces", func(t *testing.T) {
+		srv := newServer(`{"message":"boom"}`, http.StatusInternalServerError)
+		defer srv.Close()
+		svc := email.NewService(email.Config{APIKey: "test-key", FromAddress: "a@b.com", BaseURL: srv.URL})
+		require.Error(t, svc.VerifySender(context.Background()))
+	})
+
+	t.Run("no API key cannot verify", func(t *testing.T) {
+		svc := email.NewService(email.Config{})
+		require.Error(t, svc.VerifySender(context.Background()))
+	})
+}

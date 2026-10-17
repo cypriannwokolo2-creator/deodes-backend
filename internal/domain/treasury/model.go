@@ -20,7 +20,6 @@ const (
 )
 
 type TreasuryBalance struct {
-	XLM  string `json:"xlm"`
 	USDC string `json:"usdc"`
 }
 

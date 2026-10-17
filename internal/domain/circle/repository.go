@@ -31,6 +31,7 @@ type Repository interface {
 	Delete(ctx context.Context, id uuid.UUID) error
 	CreateMember(ctx context.Context, m *CircleMember) error
 	GetMembers(ctx context.Context, circleID uuid.UUID) ([]CircleMember, error)
+	SearchMembers(ctx context.Context, circleID uuid.UUID, search string) ([]CircleMember, error)
 	GetMemberCount(ctx context.Context, circleID uuid.UUID) (int, error)
 	UpdateMemberStatus(ctx context.Context, circleID, userID uuid.UUID, status MemberStatus) error
 	// UpdateMemberStrikes persists the 2.7 strike counter.

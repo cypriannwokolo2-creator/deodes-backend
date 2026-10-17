@@ -197,7 +197,7 @@ func TestListProposals_SurfacesTimelockFields(t *testing.T) {
 	p := createTimelockProposal(t, svc, creator)
 	passProposal(t, svc, p, creator)
 
-	proposals, total, err := svc.ListProposals(ctx, 1, 10)
+	proposals, total, err := svc.ListProposals(ctx, 1, 10, "")
 	require.NoError(t, err)
 	require.Equal(t, 1, total)
 	require.Len(t, proposals, 1)

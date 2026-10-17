@@ -161,6 +161,15 @@ func TestLoad_CORSNonOriginEntryRejected(t *testing.T) {
 	require.Contains(t, err.Error(), "cors.allowed_origins")
 }
 
+// Money-moving routes (transfer, withdraw, contribute, vote, …) require an
+// Idempotency-Key header, so the CORS default must allow it: otherwise the
+// browser preflight fails and sends are dead on arrival with a "Network Error".
+func TestDefaultCORSAllowedHeaders_IncludesIdempotency(t *testing.T) {
+	got := config.DefaultCORSAllowedHeaders()
+	assert.Contains(t, got, "Idempotency-Key")
+	assert.Contains(t, got, "X-Idempotency-Key")
+}
+
 // cors.max_age was previously ignored because the middleware hardcoded 12h.
 func TestLoad_CORSMaxAgeComesFromConfig(t *testing.T) {
 	setRequiredEnv(t)

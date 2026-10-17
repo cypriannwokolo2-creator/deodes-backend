@@ -55,3 +55,15 @@ func TestConfigHandler_ArcAndFiatPassthrough(t *testing.T) {
 	fiat := data["fiat"].(map[string]any)
 	assert.Equal(t, "mock", fiat["provider"])
 }
+
+func TestConfigHandler_EmailConfiguredFlag(t *testing.T) {
+	code, data := servePublicConfig(t, PublicConfig{EmailConfigured: true})
+	require.Equal(t, http.StatusOK, code)
+	email := data["email"].(map[string]any)
+	assert.Equal(t, true, email["configured"])
+
+	code, data = servePublicConfig(t, PublicConfig{})
+	require.Equal(t, http.StatusOK, code)
+	email = data["email"].(map[string]any)
+	assert.Equal(t, false, email["configured"])
+}

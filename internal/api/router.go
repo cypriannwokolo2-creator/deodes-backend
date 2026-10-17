@@ -1,6 +1,7 @@
 package api
 
 import (
+	"strings"
 	"time"
 
 	"github.com/deodes/backend/config"
@@ -24,6 +25,84 @@ func perResource(redisClient *redis.Client, resource string, limit, windowSecond
 		time.Duration(windowSeconds)*time.Second,
 		middleware.WithFailClosed(),
 	)
+}
+
+// perResourceLive resolves OTP/login buckets on every request so hot-reloaded
+// config applies without a restart. resolve reads cfg.Hot when present,
+// otherwise the startup snapshot.
+func perResourceLive(redisClient *redis.Client, cfg *config.Config, resource string, staticLimit, staticWindowSeconds int, resolve func(config.RateLimitConfig) (int, int)) gin.HandlerFunc {
+	return middleware.PerResourceRateLimitMiddlewareLive(
+		redisClient,
+		resource,
+		staticLimit,
+		time.Duration(staticWindowSeconds)*time.Second,
+		func() (int, time.Duration) {
+			rl := cfg.RateLimit
+			if cfg.Hot != nil {
+				rl = cfg.Hot.RateLimit()
+			}
+			limit, windowSecs := resolve(rl)
+			if limit <= 0 {
+				limit = staticLimit
+			}
+			if windowSecs <= 0 {
+				windowSecs = staticWindowSeconds
+			}
+			return limit, time.Duration(windowSecs) * time.Second
+		},
+		middleware.WithFailClosed(),
+	)
+}
+
+// consentLimit bounds unauthenticated consent writes per IP (30/hour
+// default). Zero config falls back to the default.
+func consentLimit(redisClient *redis.Client, cfg *config.Config) gin.HandlerFunc {
+	limit, window := cfg.RateLimit.ConsentLimit, cfg.RateLimit.ConsentWindowSeconds
+	if cfg.Hot != nil {
+		rl := cfg.Hot.RateLimit()
+		limit, window = rl.ConsentLimit, rl.ConsentWindowSeconds
+	}
+	if limit <= 0 {
+		limit = 30
+	}
+	if window <= 0 {
+		window = 3600
+	}
+	return perResource(redisClient, "consent", limit, window)
+}
+
+// otpSendLimit / otpVerifyLimit / loginLimit resolve the split buckets with
+// fallback to the legacy shared OTP bucket for old configs.
+func otpSendLimit(rl config.RateLimitConfig) (int, int)   { return rl.OTPSend() }
+func otpVerifyLimit(rl config.RateLimitConfig) (int, int) { return rl.OTPVerify() }
+func loginLimit(rl config.RateLimitConfig) (int, int)     { return rl.Login() }
+
+// claimLimit bounds anonymous name allocation per IP (20/hour default).
+// Zero config falls back to the default so bare test configs stay open.
+func claimLimit(redisClient *redis.Client, cfg *config.Config) gin.HandlerFunc {
+	limit, window := cfg.RateLimit.ClaimLimit, cfg.RateLimit.ClaimWindowSeconds
+	if cfg.Hot != nil {
+		rl := cfg.Hot.RateLimit()
+		limit, window = rl.ClaimLimit, rl.ClaimWindowSeconds
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+	if window <= 0 {
+		window = 3600
+	}
+	return perResource(redisClient, "claim-name", limit, window)
+}
+
+// passwordResetLimit wires the dual per-IP + per-account reset limiter with
+// live config and startup fallbacks (middleware defaults 5/3/15m when unset).
+func passwordResetLimit(redisClient *redis.Client, cfg *config.Config) gin.HandlerFunc {
+	rl := cfg.RateLimit
+	if cfg.Hot != nil {
+		rl = cfg.Hot.RateLimit()
+	}
+	return middleware.PasswordResetRateLimitMiddleware(
+		redisClient, rl.PasswordResetIPLimit, rl.PasswordResetAccountLimit, rl.PasswordResetWindowSeconds)
 }
 
 // liveLimitOptions wires the hot-reloadable rate limits into a middleware when
@@ -55,6 +134,7 @@ func NewRouter(
 	communityHandler *handler.CommunityHandler,
 	wsHandler *handler.WebSocketHandler,
 	savingsGoalHandler *handler.SavingsGoalHandler,
+	bankAccountHandler *handler.BankAccountHandler,
 	swapHandler *handler.SwapHandler,
 	governanceHandler *handler.GovernanceHandler,
 	reputationHandler *handler.ReputationHandler,
@@ -62,10 +142,21 @@ func NewRouter(
 	consentHandler *handler.ConsentHandler,
 	subscriptionHandler *handler.SubscriptionHandler,
 	adminJobQueueHandler *handler.AdminJobQueueHandler,
+	supportHandler *handler.SupportHandler,
 	webhookRepo webhook.WebhookRepository,
 	jwtPublicKey []byte,
 ) *gin.Engine {
 	r := gin.New()
+
+	// Trusted proxies for c.ClientIP(): without this every client behind the
+	// LB/CDN collapses to the proxy IP and shares one OTP bucket (always-429
+	// in prod). Configure server.trusted_proxies / DEODES_TRUSTED_PROXIES with
+	// the LB/CDN CIDRs. Empty = gin default (loopback only, safe for dev).
+	if len(cfg.Server.TrustedProxies) > 0 {
+		if err := r.SetTrustedProxies(cfg.Server.TrustedProxies); err != nil {
+			panic("invalid server.trusted_proxies: " + err.Error())
+		}
+	}
 
 	// CSRF boundary (#399). CSRF tokens are bound to the bearer session, so they
 	// are enforced wherever a request is authenticated:
@@ -123,15 +214,26 @@ func NewRouter(
 		auth := api.Group("/auth")
 		auth.Use(middleware.AuthRateLimitMiddleware(redisClient, cfg.RateLimit, liveLimitOptions(cfg)...))
 		{
-			auth.POST("/register", perResource(redisClient, "otp", cfg.RateLimit.OTPLimit, cfg.RateLimit.OTPWindowSeconds), authHandler.Register)
-			auth.POST("/register/verify", perResource(redisClient, "otp", cfg.RateLimit.OTPLimit, cfg.RateLimit.OTPWindowSeconds), authHandler.RegisterVerify)
-			auth.POST("/login", perResource(redisClient, "otp", cfg.RateLimit.OTPLimit, cfg.RateLimit.OTPWindowSeconds), authHandler.Login)
+			// Split OTP buckets: send and verify no longer share one 5/15m
+			// bucket. Send stays strict (spam), verify is roomier (typos),
+			// login has its own bucket (never sent OTP but shared it).
+			sendLimit, sendWindow := cfg.RateLimit.OTPSend()
+			verifyLimit, verifyWindow := cfg.RateLimit.OTPVerify()
+			loginLimitVal, loginWindow := cfg.RateLimit.Login()
+			otpSend := perResourceLive(redisClient, cfg, "otp-send", sendLimit, sendWindow, otpSendLimit)
+			otpVerify := perResourceLive(redisClient, cfg, "otp-verify", verifyLimit, verifyWindow, otpVerifyLimit)
+			loginRL := perResourceLive(redisClient, cfg, "login", loginLimitVal, loginWindow, loginLimit)
+			auth.POST("/register", otpSend, authHandler.Register)
+			auth.POST("/register/verify", otpVerify, authHandler.RegisterVerify)
+			auth.POST("/login", loginRL, authHandler.Login)
 			auth.POST("/refresh", middleware.RefreshTokenBlocklistMiddleware(redisClient), authHandler.Refresh)
-			auth.POST("/nonce", authHandler.Nonce)
-			auth.POST("/verify", authHandler.Verify)
-			auth.POST("/google", perResource(redisClient, "otp", cfg.RateLimit.OTPLimit, cfg.RateLimit.OTPWindowSeconds), authHandler.Google)
-			auth.POST("/password/forgot", perResource(redisClient, "otp", cfg.RateLimit.OTPLimit, cfg.RateLimit.OTPWindowSeconds), authHandler.ForgotPassword)
-			auth.POST("/password/reset", perResource(redisClient, "otp", cfg.RateLimit.OTPLimit, cfg.RateLimit.OTPWindowSeconds), authHandler.ResetPassword)
+			// Wallet challenge/response creates sessions like login: same
+			// long-window bucket on top of the coarse group limiter.
+			auth.POST("/nonce", loginRL, authHandler.Nonce)
+			auth.POST("/verify", loginRL, authHandler.Verify)
+			auth.POST("/google", loginRL, authHandler.Google)
+			auth.POST("/password/forgot", otpSend, passwordResetLimit(redisClient, cfg), authHandler.ForgotPassword)
+			auth.POST("/password/reset", otpVerify, passwordResetLimit(redisClient, cfg), authHandler.ResetPassword)
 		}
 
 		// User & Profile routes (authenticated)
@@ -139,7 +241,20 @@ func NewRouter(
 		// bare api group (no auth, so no CSRF session); see the CSRF boundary
 		// note above. Kept out of the authenticated block below so it can't be
 		// mistaken for an authenticated route.
-		api.POST("/claim-name", userHandler.ClaimName)
+		api.POST("/claim-name", claimLimit(redisClient, cfg), userHandler.ClaimName)
+
+		// Public invite preview for the /invite/:code landing page: signed-out
+		// recipients must review before registering. Rate-limited per IP since
+		// it is unauthenticated.
+		invitePreviewLimit := cfg.RateLimit.InvitePreviewLimit
+		invitePreviewWindow := cfg.RateLimit.InvitePreviewWindowSeconds
+		if invitePreviewLimit <= 0 {
+			invitePreviewLimit = 30
+		}
+		if invitePreviewWindow <= 0 {
+			invitePreviewWindow = 60
+		}
+		api.GET("/circles/invites/:code", perResource(redisClient, "invite-preview", invitePreviewLimit, invitePreviewWindow), inviteHandler.Preview)
 
 		// Public client configuration (Phase 2.3) — pre-login feature flags
 		// (google_enabled, arc addresses, fiat provider). GET is CSRF-safe by
@@ -150,6 +265,7 @@ func NewRouter(
 			ArcCircleAddress:   cfg.Arc.CircleAddress,
 			ArcTreasuryAddress: cfg.Arc.TreasuryAddress,
 			ArcUSDCContract:    cfg.Arc.USDCContract,
+			EmailConfigured:    strings.TrimSpace(cfg.Brevo.APIKey) != "",
 		})
 		api.GET("/config", configHandler.PublicConfig)
 
@@ -180,8 +296,11 @@ func NewRouter(
 			authenticated.GET("/me", authHandler.Me)
 			authenticated.PATCH("/me", userHandler.UpdateProfile)
 			authenticated.PATCH("/users/me", userHandler.UpdateProfile)
+			authenticated.DELETE("/users/me", userHandler.DeleteMe)
+			authenticated.GET("/users/lookup", userHandler.LookupByEmail)
 			authenticated.GET("/users/me/subscriptions", subscriptionHandler.ListMine)
 			authenticated.POST("/auth/logout", authHandler.Logout)
+			authenticated.GET("/sessions", authHandler.ListSessions)
 			authenticated.POST("/auth/password/change", authHandler.ChangePassword)
 			authenticated.DELETE("/sessions/:id", authHandler.RevokeSessionByID)
 			emailChangeLimit := perResource(redisClient, "email-change", cfg.RateLimit.OTPLimit, cfg.RateLimit.OTPWindowSeconds)
@@ -199,11 +318,26 @@ func NewRouter(
 			authenticated.POST("/wallets", walletHandler.CreateWallet)
 			authenticated.POST("/wallets/hosted-arc/ensure", walletHandler.EnsureHostedArcWallet)
 			authenticated.POST("/wallets/hosted-arc", requireIdem, walletHandler.CreateHostedArcWallet)
-			authenticated.POST("/wallets/link", walletHandler.LinkWallet)
+			authenticated.POST("/wallets/link", perResource(redisClient, "wallet-link", cfg.RateLimit.OTPLimit, cfg.RateLimit.OTPWindowSeconds), walletHandler.LinkWallet)
 			authenticated.GET("/wallets", walletHandler.ListWallets)
 			authenticated.GET("/wallets/balance", walletHandler.GetBalance)
 			authenticated.POST("/wallets/withdraw", requireIdem, perResource(redisClient, "wallet-transfer", cfg.RateLimit.WalletTransferLimit, cfg.RateLimit.WalletTransferWindowSeconds), walletHandler.Withdraw)
 			authenticated.DELETE("/wallets/:id", walletHandler.DeleteWallet)
+
+			// Saved fiat payout rails (payment settings screen).
+			authenticated.GET("/bank-accounts", bankAccountHandler.List)
+			authenticated.POST("/bank-accounts", bankAccountHandler.Create)
+			authenticated.POST("/bank-accounts/:id/default", bankAccountHandler.SetDefault)
+			authenticated.DELETE("/bank-accounts/:id", bankAccountHandler.Delete)
+
+			// Member-to-member USDC sends (transfer screen: internal email /
+			// address, external address). Idempotency-keyed like withdrawals.
+			authenticated.GET("/wallets/allowance", walletHandler.Allowance)
+			authenticated.POST("/wallets/transfer", requireIdem, perResource(redisClient, "wallet-transfer", cfg.RateLimit.WalletTransferLimit, cfg.RateLimit.WalletTransferWindowSeconds), walletHandler.Transfer)
+		// On-chain outcome reported by the sender's client once the receipt
+		// settles; fans out transfer.confirmed/failed/received in-app
+		// notifications (idempotent per tx hash).
+		authenticated.POST("/wallets/transfers/:txHash/outcome", perResource(redisClient, "transfer-outcome", cfg.RateLimit.OTPLimit, cfg.RateLimit.OTPWindowSeconds), walletHandler.ReportTransferOutcome)
 
 			// Authenticator (TOTP) enrollment. Code checks share the OTP
 			// limiter so six-digit codes cannot be brute-forced.
@@ -282,9 +416,11 @@ func NewRouter(
 			// Reputation tiers
 			authenticated.GET("/reputation/tiers", reputationHandler.GetTiers)
 			authenticated.GET("/reputation/tier/:address", reputationHandler.GetTierByAddress)
+			authenticated.GET("/reputation/leaderboard", reputationHandler.Leaderboard)
 
 			// Referral system
 			authenticated.POST("/referral/code", perResource(redisClient, "referral", cfg.RateLimit.ReferralLimit, cfg.RateLimit.ReferralWindowSeconds), referralHandler.GenerateCode)
+			authenticated.POST("/referral/apply", referralHandler.ApplyCode)
 			authenticated.GET("/referral/stats", referralHandler.GetStats)
 			authenticated.GET("/referral/history", referralHandler.GetHistory)
 
@@ -349,8 +485,21 @@ func NewRouter(
 			// is not captured by a wildcard parameter.
 			admin.GET("/users/deleted", adminHandler.ListDeletedUsers)
 			admin.POST("/users/:id/restore", adminHandler.RestoreUser)
+			admin.GET("/users/:id", adminHandler.GetUserDetail)
+			admin.POST("/users/:id/freeze", adminHandler.FreezeUserFunds)
+			admin.POST("/users/:id/unfreeze", adminHandler.UnfreezeUserFunds)
+			admin.GET("/frozen-wallets", adminHandler.ListFrozenWallets)
 			admin.GET("/circles", adminHandler.ListCircles)
 			admin.GET("/circles/:id/inspect", adminHandler.InspectCircleState)
+			admin.POST("/circles/:id/pause", adminHandler.PauseCircle)
+			admin.POST("/circles/:id/resume", adminHandler.ResumeCircle)
+			admin.POST("/circles/:id/ban", adminHandler.BanCircle)
+			admin.GET("/communities", adminHandler.ListCommunities)
+			admin.POST("/communities/:id/suspend", adminHandler.SuspendCommunity)
+			admin.POST("/communities/:id/unsuspend", adminHandler.UnsuspendCommunity)
+			admin.POST("/communities/:id/ban", adminHandler.BanCommunity)
+			admin.GET("/support-tickets", supportHandler.ListTickets)
+			admin.PATCH("/support-tickets/:id", supportHandler.UpdateTicket)
 			admin.GET("/audit-log", adminHandler.GetAuditLog)
 			admin.GET("/metrics", adminHandler.GetMetrics)
 			admin.GET("/feature-flags", adminHandler.ListFeatureFlags)
@@ -371,7 +520,10 @@ func NewRouter(
 
 			// GDPR cookie consent — works for both authenticated and anonymous users
 			optional.GET("/consent", consentHandler.GetConsent)
-			optional.POST("/consent", consentHandler.SaveConsent)
+			optional.POST("/consent", consentLimit(redisClient, cfg), consentHandler.SaveConsent)
+
+			// Contact-form inbox — anyone can open a ticket; throttled against spam.
+			optional.POST("/support", perResource(redisClient, "support", cfg.RateLimit.OTPLimit, cfg.RateLimit.OTPWindowSeconds), supportHandler.CreateTicket)
 		}
 	}
 

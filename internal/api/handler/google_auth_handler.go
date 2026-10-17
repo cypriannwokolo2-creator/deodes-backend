@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
@@ -118,6 +119,12 @@ func (h *GoogleAuthHandler) provision(ctx context.Context, profile *google.Profi
 	if strings.TrimSpace(profile.Name) != "" {
 		name := strings.TrimSpace(profile.Name)
 		u.DisplayName = &name
+	}
+	// Same email-derived username rule as email registration.
+	if username, err := user.EnsureUsername(ctx, h.userRepo, profile.Email); err != nil {
+		return nil, fmt.Errorf("assigning username: %w", err)
+	} else {
+		u.Username = &username
 	}
 	if err := h.userRepo.Create(ctx, u); err != nil {
 		if err == apperrors.ErrConflict {

@@ -32,3 +32,11 @@ func (m *Repository) GetHistory(ctx context.Context, userID uuid.UUID, months in
 	}
 	return args.Get(0).([]reputation.ReputationSnapshot), args.Error(1)
 }
+
+func (m *Repository) TopScores(ctx context.Context, limit int) ([]reputation.LeaderboardEntry, error) {
+	args := m.Called(ctx, limit)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]reputation.LeaderboardEntry), args.Error(1)
+}

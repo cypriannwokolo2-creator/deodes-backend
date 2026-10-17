@@ -36,12 +36,26 @@ rate_limit:
   authenticated: 300
   auth: 10
   fail_closed: true   # default; the single policy
+  otp_send_limit: 5             # POST /auth/register, /auth/password/forgot
+  otp_send_window_seconds: 900
+  otp_verify_limit: 15          # POST /auth/register/verify, /auth/password/reset
+  otp_verify_window_seconds: 900
+  login_limit: 20               # POST /auth/login, /auth/google
+  login_window_seconds: 900
+  invite_preview_limit: 30      # GET /circles/invites/:code (public)
+  invite_preview_window_seconds: 60
+server:
+  trusted_proxies: [] # LB/CDN CIDRs; empty = loopback only
 ```
 
 `rate_limit.fail_closed` is the global default (`true`). It is applied
 consistently by all three middleware constructors:
 `RateLimitMiddleware`, `AuthRateLimitMiddleware` (global + authenticated
 limits), and `PerResourceRateLimitMiddleware`.
+
+Split buckets: `otp-send`, `otp-verify`, and `login` are independent Redis
+keys (`ratelimit:r:<resource>:<IP>`), hot-reloadable without restart.
+Every 429/503 carries `Retry-After` (seconds) plus `X-RateLimit-*`.
 
 ## Per-route overrides
 

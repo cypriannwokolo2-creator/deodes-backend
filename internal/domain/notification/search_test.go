@@ -21,5 +21,15 @@ func TestBuildSearchConditions(t *testing.T) {
 		IncludeArchived: true,
 	})
 	assert.Equal(t, "WHERE user_id = $1 AND is_read = false AND type = $2 AND (title ILIKE $3 OR body ILIKE $3)", where)
-	assert.Equal(t, []any{uid, "contribution.due", `%50\%\_off%`}, args)
+	assert.Equal(t, []any{uid, "contribution_due", `%50\%\_off%`}, args)
+}
+
+func TestDBNotificationType(t *testing.T) {
+	// The enum stores underscores; Go constants use dots. Both directions
+	// below must persist and filter against the same stored labels.
+	assert.Equal(t, NotificationType("transfer_confirmed"), dbNotificationType(TypeTransferConfirmed))
+	assert.Equal(t, NotificationType("transfer_failed"), dbNotificationType(TypeTransferFailed))
+	assert.Equal(t, NotificationType("transfer_received"), dbNotificationType(TypeTransferReceived))
+	assert.Equal(t, NotificationType("contribution_due"), dbNotificationType(TypeContributionDue))
+	assert.Equal(t, NotificationType("system"), dbNotificationType("system"))
 }

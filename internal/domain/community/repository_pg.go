@@ -22,7 +22,7 @@ func NewRepository(db *sqlx.DB) Repository {
 }
 
 func (r *pgRepo) Create(ctx context.Context, c *Community) error {
-	query := `INSERT INTO communities (id, name, slug, description, category, tags, avatar_url, banner_url, owner_id, member_count, total_saved, is_featured, created_at, updated_at)
+	query := `INSERT INTO communities (id, name, slug, description, category, tags, avatar_url, banner_url, owner_id, member_count, total_saved, is_featured, created_at, updated_at, suspended_at, suspended_reason)
 		VALUES (:id, :name, :slug, :description, :category, :tags, :avatar_url, :banner_url, :owner_id, :member_count, :total_saved, :is_featured, :created_at, :updated_at)`
 	_, err := r.db.NamedExecContext(ctx, query, c)
 	if err != nil {
@@ -36,12 +36,13 @@ func (r *pgRepo) Create(ctx context.Context, c *Community) error {
 
 func scanCommunity(row interface{ Scan(...interface{}) error }) (*Community, error) {
 	var c Community
-	var avatarURL, bannerURL sql.NullString
+	var avatarURL, bannerURL, suspendedReason sql.NullString
+	var suspendedAt sql.NullTime
 	err := row.Scan(
 		&c.ID, &c.Name, &c.Slug, &c.Description, &c.Category,
 		&c.Tags, &avatarURL, &bannerURL, &c.OwnerID,
 		&c.MemberCount, &c.TotalSaved, &c.IsFeatured,
-		&c.CreatedAt, &c.UpdatedAt,
+		&c.CreatedAt, &c.UpdatedAt, &suspendedAt, &suspendedReason,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -57,16 +58,26 @@ func scanCommunity(row interface{ Scan(...interface{}) error }) (*Community, err
 	if !bannerURL.Valid {
 		c.BannerURL = nil
 	}
+	if suspendedAt.Valid {
+		c.SuspendedAt = &suspendedAt.Time
+	}
+	if suspendedReason.Valid {
+		c.SuspendedReason = &suspendedReason.String
+	}
 	return &c, nil
 }
 
+// communityColumns is the canonical column list for community reads; every
+// SELECT feeding scanCommunity must use it in order.
+const communityColumns = `id, name, slug, description, category, tags, avatar_url, banner_url, owner_id, member_count, total_saved, is_featured, created_at, updated_at, suspended_at, suspended_reason, suspended_at, suspended_reason`
+
 func (r *pgRepo) FindByID(ctx context.Context, id uuid.UUID) (*Community, error) {
-	query := `SELECT id, name, slug, description, category, tags, avatar_url, banner_url, owner_id, member_count, total_saved, is_featured, created_at, updated_at FROM communities WHERE id = $1 AND deleted_at IS NULL`
+	query := `SELECT id, name, slug, description, category, tags, avatar_url, banner_url, owner_id, member_count, total_saved, is_featured, created_at, updated_at, suspended_at, suspended_reason FROM communities WHERE id = $1 AND deleted_at IS NULL`
 	return scanCommunity(r.db.QueryRowxContext(ctx, query, id))
 }
 
 func (r *pgRepo) FindBySlug(ctx context.Context, slug string) (*Community, error) {
-	query := `SELECT id, name, slug, description, category, tags, avatar_url, banner_url, owner_id, member_count, total_saved, is_featured, created_at, updated_at FROM communities WHERE slug = $1 AND deleted_at IS NULL`
+	query := `SELECT id, name, slug, description, category, tags, avatar_url, banner_url, owner_id, member_count, total_saved, is_featured, created_at, updated_at, suspended_at, suspended_reason FROM communities WHERE slug = $1 AND deleted_at IS NULL`
 	return scanCommunity(r.db.QueryRowxContext(ctx, query, slug))
 }
 
@@ -97,6 +108,11 @@ func (r *pgRepo) List(ctx context.Context, filter CommunityFilter) ([]Community,
 	}
 
 	conditions = append(conditions, "communities.deleted_at IS NULL")
+	// Suspended communities are hidden from public listing; admins pass
+	// IncludeSuspended to moderate them.
+	if !filter.IncludeSuspended {
+		conditions = append(conditions, "communities.suspended_at IS NULL")
+	}
 
 	where := ""
 	if len(conditions) > 0 {
@@ -109,7 +125,7 @@ func (r *pgRepo) List(ctx context.Context, filter CommunityFilter) ([]Community,
 		return nil, 0, fmt.Errorf("counting communities: %w", err)
 	}
 
-	query := fmt.Sprintf(`SELECT id, name, slug, description, category, tags, avatar_url, banner_url, owner_id, member_count, total_saved, is_featured, created_at, updated_at
+	query := fmt.Sprintf(`SELECT id, name, slug, description, category, tags, avatar_url, banner_url, owner_id, member_count, total_saved, is_featured, created_at, updated_at, suspended_at, suspended_reason
 		FROM communities %s ORDER BY is_featured DESC, member_count DESC LIMIT $%d OFFSET $%d`, where, argIdx, argIdx+1)
 	args = append(args, limit, offset)
 
@@ -148,6 +164,18 @@ func (r *pgRepo) Delete(ctx context.Context, id uuid.UUID) error {
 	return err
 }
 
+func (r *pgRepo) Suspend(ctx context.Context, id uuid.UUID, reason string) error {
+	_, err := r.db.ExecContext(ctx,
+		`UPDATE communities SET suspended_at = NOW(), suspended_reason = $2 WHERE id = $1 AND deleted_at IS NULL`, id, reason)
+	return err
+}
+
+func (r *pgRepo) Unsuspend(ctx context.Context, id uuid.UUID) error {
+	_, err := r.db.ExecContext(ctx,
+		`UPDATE communities SET suspended_at = NULL, suspended_reason = NULL WHERE id = $1`, id)
+	return err
+}
+
 func (r *pgRepo) AddMember(ctx context.Context, m *CommunityMember) error {
 	_, err := r.db.NamedExecContext(ctx, `INSERT INTO community_members (community_id, user_id, role, joined_at) VALUES (:community_id, :user_id, :role, :joined_at)`, m)
 	if err != nil {
@@ -175,7 +203,26 @@ func (r *pgRepo) UpdateMemberRole(ctx context.Context, communityID, userID uuid.
 }
 
 func (r *pgRepo) GetMembers(ctx context.Context, communityID uuid.UUID) ([]CommunityMember, error) {
-	rows, err := r.db.QueryxContext(ctx, `SELECT community_id, user_id, role, joined_at FROM community_members WHERE community_id = $1 ORDER BY joined_at ASC`, communityID)
+	return r.listMembers(ctx, communityID, "")
+}
+
+// SearchMembers filters community members by username/display name substring.
+func (r *pgRepo) SearchMembers(ctx context.Context, communityID uuid.UUID, search string) ([]CommunityMember, error) {
+	return r.listMembers(ctx, communityID, search)
+}
+
+func (r *pgRepo) listMembers(ctx context.Context, communityID uuid.UUID, search string) ([]CommunityMember, error) {
+	query := `SELECT cm.community_id, cm.user_id, cm.role, cm.joined_at,
+		u.username, u.display_name
+		FROM community_members cm LEFT JOIN users u ON u.id = cm.user_id
+		WHERE cm.community_id = $1`
+	args := []interface{}{communityID}
+	if search = strings.TrimSpace(search); search != "" {
+		args = append(args, "%"+search+"%")
+		query += ` AND (u.username ILIKE $2 OR u.display_name ILIKE $2)`
+	}
+	query += ` ORDER BY cm.joined_at ASC`
+	rows, err := r.db.QueryxContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("getting members: %w", err)
 	}
@@ -183,8 +230,15 @@ func (r *pgRepo) GetMembers(ctx context.Context, communityID uuid.UUID) ([]Commu
 	var members []CommunityMember
 	for rows.Next() {
 		var m CommunityMember
-		if err := rows.Scan(&m.CommunityID, &m.UserID, &m.Role, &m.JoinedAt); err != nil {
+		var username, displayName sql.NullString
+		if err := rows.Scan(&m.CommunityID, &m.UserID, &m.Role, &m.JoinedAt, &username, &displayName); err != nil {
 			return nil, err
+		}
+		if username.Valid {
+			m.Username = &username.String
+		}
+		if displayName.Valid {
+			m.DisplayName = &displayName.String
 		}
 		members = append(members, m)
 	}
@@ -287,7 +341,7 @@ func (r *pgRepo) UpdateTotalSaved(ctx context.Context, communityID uuid.UUID) er
 }
 
 func (r *pgRepo) FindByUserID(ctx context.Context, userID uuid.UUID) ([]Community, error) {
-	rows, err := r.db.QueryxContext(ctx, `SELECT c.id, c.name, c.slug, c.description, c.category, c.tags, c.avatar_url, c.banner_url, c.owner_id, c.member_count, c.total_saved, c.is_featured, c.created_at, c.updated_at FROM communities c INNER JOIN community_members cm ON cm.community_id = c.id WHERE c.deleted_at IS NULL AND cm.user_id = $1 ORDER BY c.name`, userID)
+	rows, err := r.db.QueryxContext(ctx, `SELECT c.id, c.name, c.slug, c.description, c.category, c.tags, c.avatar_url, c.banner_url, c.owner_id, c.member_count, c.total_saved, c.is_featured, c.created_at, c.updated_at, c.suspended_at, c.suspended_reason FROM communities c INNER JOIN community_members cm ON cm.community_id = c.id WHERE c.deleted_at IS NULL AND cm.user_id = $1 ORDER BY c.name`, userID)
 	if err != nil {
 		return nil, fmt.Errorf("finding communities by user: %w", err)
 	}

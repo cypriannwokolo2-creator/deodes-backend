@@ -141,7 +141,7 @@ func activeFixedCircle(cid, orgID uuid.UUID) *circle.Circle {
 	return &circle.Circle{
 		ID: cid, Name: "Test", Status: circle.CircleStatusActive,
 		OrganizerID: orgID, PayoutType: circle.PayoutTypeFixed,
-		CurrentRound: 2, MaxMembers: 4,
+		CurrentRound: 2, MaxMembers: 4, ContributionAmount: 100,
 	}
 }
 

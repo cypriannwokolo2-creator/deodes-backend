@@ -22,6 +22,10 @@ type PublicConfig struct {
 	// FiatProvider names the active fiat rail. Only "mock" exists until
 	// Phase 2.18 lands the pluggable provider switch.
 	FiatProvider string
+	// EmailConfigured reports whether a Brevo API key is set, so the UI can
+	// banner email-delivery outages instead of stranding users on OTP
+	// screens. Boolean only — never a key, address, or provider detail.
+	EmailConfigured bool
 }
 
 // ConfigHandler serves GET /v1/config: public, pre-auth feature flags so
@@ -55,6 +59,9 @@ func (h *ConfigHandler) PublicConfig(c *gin.Context) {
 		},
 		"fiat": gin.H{
 			"provider": h.cfg.FiatProvider,
+		},
+		"email": gin.H{
+			"configured": h.cfg.EmailConfigured,
 		},
 	})
 }

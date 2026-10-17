@@ -84,6 +84,10 @@ func (s *stubGoogleUserRepo) FindByWalletAddress(ctx context.Context, w string) 
 	return nil, errGoogleNotFound
 }
 
+func (s *stubGoogleUserRepo) FindByUsername(_ context.Context, _ string) (*user.User, error) {
+	return nil, apperrors.ErrNotFound
+}
+
 type stubGoogleWallet struct {
 	wallet.Service
 }

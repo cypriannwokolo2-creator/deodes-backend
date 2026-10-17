@@ -1,6 +1,7 @@
 package mocks
 
 import (
+	"time"
 	"context"
 
 	"github.com/stretchr/testify/mock"
@@ -62,6 +63,19 @@ func (m *Repository) GetSummary(ctx context.Context, userID string) (*savings.Go
 		return nil, args.Error(1)
 	}
 	return args.Get(0).(*savings.GoalSummary), args.Error(1)
+}
+
+func (m *Repository) DueAutoGoals(ctx context.Context, now time.Time) ([]savings.SavingsGoal, error) {
+	args := m.Called(ctx, now)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]savings.SavingsGoal), args.Error(1)
+}
+
+func (m *Repository) RecordTopUp(ctx context.Context, goalID string, amount float64) (bool, error) {
+	args := m.Called(ctx, goalID, amount)
+	return args.Bool(0), args.Error(1)
 }
 
 func (m *Repository) GetUpcomingObligations(ctx context.Context, userID string, limit int) ([]savings.SavingsGoal, error) {

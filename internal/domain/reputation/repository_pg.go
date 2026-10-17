@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -40,6 +41,27 @@ func (r *pgRepo) GetByUser(ctx context.Context, userID uuid.UUID) (*ReputationSn
 	query := `SELECT user_id, score, level, breakdown, month, created_at
 		FROM reputation_snapshots WHERE user_id = $1 ORDER BY month DESC LIMIT 1`
 	return scanSnapshot(r.db.QueryRowxContext(ctx, query, userID))
+}
+
+// TopScores returns the highest latest-month snapshots with identity joined.
+func (r *pgRepo) TopScores(ctx context.Context, limit int) ([]LeaderboardEntry, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	entries := []LeaderboardEntry{}
+	err := r.db.SelectContext(ctx, &entries, `
+		SELECT DISTINCT ON (rs.user_id) rs.user_id, u.username, u.display_name, rs.score, rs.level
+		FROM reputation_snapshots rs
+		LEFT JOIN users u ON u.id = rs.user_id
+		ORDER BY rs.user_id, rs.month DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("listing top reputation scores: %w", err)
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Score > entries[j].Score })
+	if len(entries) > limit {
+		entries = entries[:limit]
+	}
+	return entries, nil
 }
 
 func (r *pgRepo) SaveSnapshot(ctx context.Context, s *ReputationSnapshot) error {

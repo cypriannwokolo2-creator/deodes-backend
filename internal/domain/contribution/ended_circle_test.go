@@ -45,3 +45,25 @@ func TestContributionService_Record_RejectsEndedCircle(t *testing.T) {
 		})
 	}
 }
+
+func TestContributionService_Record_RejectsSuspendedCircle(t *testing.T) {
+	for _, status := range []circle.CircleStatus{circle.CircleStatusPaused, circle.CircleStatusBanned} {
+		t.Run(string(status), func(t *testing.T) {
+			repo := new(contribMocks.Repository)
+			svc := contribution.NewService(repo, nil, nil, statusCircleService{status: status})
+
+			c, err := svc.Record(context.Background(), contribution.RecordInput{
+				CircleID:    uuid.New().String(),
+				UserID:      uuid.New().String(),
+				RoundNumber: 1,
+				Amount:      100,
+				TxnHash:     "txn-suspended",
+			})
+
+			assert.ErrorIs(t, err, apperrors.ErrCircleSuspended)
+			assert.Nil(t, c)
+			repo.AssertNotCalled(t, "FindByTxnHash")
+			repo.AssertNotCalled(t, "Create")
+		})
+	}
+}

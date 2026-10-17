@@ -137,13 +137,53 @@ func (c *Client) GetLogs(ctx context.Context, fromBlock, toBlock uint64, address
 }
 
 // Receipt is the subset of eth_getTransactionReceipt the indexer needs:
-// execution status and the contract the tx executed against.
+// execution status, the contract the tx executed against, and the event logs
+// (for record-time Transfer coverage checks).
 type Receipt struct {
 	TransactionHash string
 	BlockNumber     uint64
 	To              string
 	Status          uint64
 	Found           bool
+	// Logs is nil when the node omitted them; empty when the receipt truly
+	// carries no events. Callers must distinguish: nil means "unknown",
+	// empty means "no token movement proven".
+	Logs []Log
+}
+
+// TransferEventSig is keccak256("Transfer(address,address,uint256)").
+const TransferEventSig = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+
+// MaxTransferValue returns the largest ERC-20 Transfer value emitted by the
+// token contract within receipt logs, or nil when none match. Standard
+// Transfers carry indexed from/to topics with the value in data; anything
+// else is skipped (a malformed log must never fail verification outright).
+func MaxTransferValue(logs []Log, token string) *big.Int {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return nil
+	}
+	var max *big.Int
+	for _, l := range logs {
+		if !strings.EqualFold(strings.TrimSpace(l.Address), token) {
+			continue
+		}
+		if len(l.Topics) != 3 || !strings.EqualFold(strings.TrimSpace(l.Topics[0]), TransferEventSig) {
+			continue
+		}
+		words, err := DataWords(l.Data)
+		if err != nil || len(words) != 1 {
+			continue
+		}
+		v := WordToUint(words[0])
+		if v.Sign() <= 0 {
+			continue
+		}
+		if max == nil || v.Cmp(max) > 0 {
+			max = v
+		}
+	}
+	return max
 }
 
 // GetTransactionReceipt returns nil, nil when the tx is not yet mined.
@@ -156,15 +196,29 @@ func (c *Client) GetTransactionReceipt(ctx context.Context, txHash string) (*Rec
 		return nil, nil
 	}
 	var r struct {
-		TransactionHash string `json:"transactionHash"`
-		BlockNumber     string `json:"blockNumber"`
-		To              string `json:"to"`
-		Status          string `json:"status"`
+		TransactionHash string   `json:"transactionHash"`
+		BlockNumber     string   `json:"blockNumber"`
+		To              string   `json:"to"`
+		Status          string   `json:"status"`
+		Logs            []rawLog `json:"logs"`
 	}
 	if err := json.Unmarshal(raw, &r); err != nil {
 		return nil, fmt.Errorf("eth_getTransactionReceipt: %w", err)
 	}
 	out := &Receipt{TransactionHash: r.TransactionHash, To: r.To, Found: true}
+	// Logs are best-effort: a node that omits them (nil) leaves coverage
+	// unknown, while a malformed entry is skipped rather than failing the
+	// whole lookup — under-confirming is safe, erroring is not.
+	if r.Logs != nil {
+		out.Logs = make([]Log, 0, len(r.Logs))
+		for i := range r.Logs {
+			l, err := r.Logs[i].toLog()
+			if err != nil {
+				continue
+			}
+			out.Logs = append(out.Logs, l)
+		}
+	}
 	bn, err := parseHexUint(r.BlockNumber)
 	if err != nil {
 		return nil, fmt.Errorf("receipt blockNumber: %w", err)

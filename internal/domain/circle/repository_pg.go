@@ -86,12 +86,19 @@ func scanCircle(row interface{ Scan(...interface{}) error }) (*Circle, error) {
 
 func scanCircleMember(row interface{ Scan(...interface{}) error }) (*CircleMember, error) {
 	var m CircleMember
-	err := row.Scan(&m.CircleID, &m.UserID, &m.Position, &m.Status, &m.Strikes, &m.JoinedAt)
+	var username, displayName sql.NullString
+	err := row.Scan(&m.CircleID, &m.UserID, &m.Position, &m.Status, &m.Strikes, &m.JoinedAt, &username, &displayName)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, apperrors.ErrNotFound
 		}
 		return nil, fmt.Errorf("scanning circle member row: %w", err)
+	}
+	if username.Valid {
+		m.Username = &username.String
+	}
+	if displayName.Valid {
+		m.DisplayName = &displayName.String
 	}
 	return &m, nil
 }
@@ -357,9 +364,26 @@ func (r *pgRepo) CreateMember(ctx context.Context, m *CircleMember) error {
 }
 
 func (r *pgRepo) GetMembers(ctx context.Context, circleID uuid.UUID) ([]CircleMember, error) {
-	query := `SELECT circle_id, user_id, position, status, strikes, joined_at
-		FROM circle_members WHERE circle_id = $1 ORDER BY position ASC`
-	rows, err := r.db.QueryxContext(ctx, query, circleID)
+	return r.listMembers(ctx, circleID, "")
+}
+
+// SearchMembers filters circle members by username/display name substring.
+func (r *pgRepo) SearchMembers(ctx context.Context, circleID uuid.UUID, search string) ([]CircleMember, error) {
+	return r.listMembers(ctx, circleID, search)
+}
+
+func (r *pgRepo) listMembers(ctx context.Context, circleID uuid.UUID, search string) ([]CircleMember, error) {
+	query := `SELECT cm.circle_id, cm.user_id, cm.position, cm.status, cm.strikes, cm.joined_at,
+		u.username, u.display_name
+		FROM circle_members cm LEFT JOIN users u ON u.id = cm.user_id
+		WHERE cm.circle_id = $1`
+	args := []interface{}{circleID}
+	if search = strings.TrimSpace(search); search != "" {
+		args = append(args, "%"+search+"%")
+		query += ` AND (u.username ILIKE $2 OR u.display_name ILIKE $2)`
+	}
+	query += ` ORDER BY cm.position ASC`
+	rows, err := r.db.QueryxContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("getting circle members: %w", err)
 	}
@@ -406,8 +430,10 @@ func (r *pgRepo) UpdateMemberStatus(ctx context.Context, circleID, userID uuid.U
 }
 
 func (r *pgRepo) FindMemberByCircleAndUser(ctx context.Context, circleID, userID uuid.UUID) (*CircleMember, error) {
-	query := `SELECT circle_id, user_id, position, status, strikes, joined_at
-		FROM circle_members WHERE circle_id = $1 AND user_id = $2`
+	query := `SELECT cm.circle_id, cm.user_id, cm.position, cm.status, cm.strikes, cm.joined_at,
+		u.username, u.display_name
+		FROM circle_members cm LEFT JOIN users u ON u.id = cm.user_id
+		WHERE cm.circle_id = $1 AND cm.user_id = $2`
 	return scanCircleMember(r.db.QueryRowxContext(ctx, query, circleID, userID))
 }
 

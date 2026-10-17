@@ -13,6 +13,7 @@ import (
 type Service interface {
 	CalculateScore(ctx context.Context, userID string, consecutiveStreaks int, completedCircles int, totalVolumeUSD float64, daysSinceLast int) (*ReputationSnapshot, error)
 	UpdateScore(ctx context.Context, userID string, consecutiveStreaks int, completedCircles int, totalVolumeUSD float64, daysSinceLast int) (*ReputationSnapshot, error)
+	TopScores(ctx context.Context, limit int) ([]LeaderboardEntry, error)
 }
 
 type reputationService struct {
@@ -83,6 +84,13 @@ func (s *reputationService) UpdateScore(ctx context.Context, userID string, cons
 	}
 
 	return snapshot, nil
+}
+
+func (s *reputationService) TopScores(ctx context.Context, limit int) ([]LeaderboardEntry, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	return s.repo.TopScores(ctx, limit)
 }
 
 func calcLevel(score int) string {

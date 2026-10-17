@@ -22,6 +22,12 @@ server:
   # Maximum time to drain in-flight requests after SIGTERM before the
   # remaining connections are closed forcibly.
   shutdown_timeout: "30s"
+  # CIDRs / IPs trusted for X-Forwarded-For when deriving client IP for rate
+  # limiting. MUST include the LB/CDN in front of deodes.com, otherwise all
+  # clients share one OTP bucket (always-429). Example:
+  #   trusted_proxies: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+  # Or via env DEODES_TRUSTED_PROXIES (comma-separated). Empty = loopback only.
+  trusted_proxies: []
 
 database:
   # Optional read replica (env DEODES_DATABASE_REPLICA_URL). When set,
@@ -115,6 +121,8 @@ cors:
     - "X-CSRF-Token"
     - "Content-Type"
     - "X-Request-ID"
+    - "Idempotency-Key"
+    - "X-Idempotency-Key"
   allow_credentials: true
   max_age: "24h"
 
@@ -128,6 +136,24 @@ rate_limit:
   # the same posture the legacy JS middleware/rateLimiter.js always had.
   # Individual routes may opt into fail-open via the middleware options.
   fail_closed: true
+  # Split OTP buckets: send stays strict, verify is roomier for typos, login
+  # has its own bucket. Previously all 6 auth endpoints shared otp_limit 5/15m.
+  otp_limit: 5
+  otp_window_seconds: 900
+  otp_send_limit: 5
+  otp_send_window_seconds: 900
+  otp_verify_limit: 15
+  otp_verify_window_seconds: 900
+  login_limit: 20
+  login_window_seconds: 900
+  # Public invite preview (landing page, unauthenticated — high-entropy codes).
+  invite_preview_limit: 30
+  invite_preview_window_seconds: 60
+  # Anonymous writes (claim-name allocates names, consent records).
+  claim_limit: 20
+  claim_window_seconds: 3600
+  consent_limit: 30
+  consent_window_seconds: 3600
 
 logging:
   level: "debug"
@@ -160,6 +186,10 @@ mobile_money:
 swap:
   # How often the sweep worker releases escrow for expired swap offers (#243).
   sweep_interval: "1m"
+
+transfer:
+  # Max completed sends per rolling 24h (withdraw + member transfers, C2).
+  daily_limit_usd: 1000
 
 governance:
   # How long a proposal that has passed its vote waits before it can be

@@ -72,6 +72,12 @@ func (h *RegistrationHandler) Login(c *gin.Context) {
 		return
 	}
 
+	// Canonical email form (matches EmailChangeHandler): mailbox delivery is
+	// case-insensitive, but Redis OTP keys, wallet derivation, and HashEmail
+	// are all case-SENSITIVE. One normalization point keeps register, resend,
+	// verify, and login on the same keys for every spelling of the address.
+	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
+
 	u, err := h.userRepo.FindByEmail(c.Request.Context(), req.Email)
 	if err != nil {
 		// Same message as a bad password: account existence is not revealed.
@@ -117,13 +123,15 @@ func (h *RegistrationHandler) Login(c *gin.Context) {
 // @Router /auth/register [post]
 func (h *RegistrationHandler) Register(c *gin.Context) {
 	var req struct {
-		Email    string `json:"email" binding:"required,email"`
-		Password string `json:"password" binding:"required,min=8"`
+		Email       string `json:"email" binding:"required,email"`
+		Password    string `json:"password" binding:"required,min=8"`
+		DisplayName string `json:"displayName" binding:"max=60"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, err.Error())
 		return
 	}
+	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
 
 	// Derive a deterministic wallet address for email-based accounts.
 	walletAddr := emailWalletAddress(req.Email)
@@ -134,8 +142,23 @@ func (h *RegistrationHandler) Register(c *gin.Context) {
 		response.InternalError(c, "failed to check existing account")
 		return
 	}
+	// Second key: password accounts carry the EMAIL: pseudo-wallet, but
+	// Google sign-in (and accounts from before the EMAIL: scheme) store a
+	// real wallet address — those users are only findable by email. Without
+	// this leg the OTP was actually emailed to existing accounts before
+	// RegisterVerify hit the unique-email conflict.
+	if existing == nil {
+		existing, err = h.userRepo.FindByEmail(c.Request.Context(), req.Email)
+		if err != nil && err != apperrors.ErrNotFound {
+			response.InternalError(c, "failed to check existing account")
+			return
+		}
+	}
 	if existing != nil {
-		response.Conflict(c, "account already exists")
+		// Anti-enumeration (H1): same success shape as a fresh registration,
+		// without storing anything or sending a code. Distinguishing 409s
+		// let anyone oracle registered emails.
+		response.OK(c, gin.H{"message": "verification code sent to your email"})
 		return
 	}
 
@@ -151,6 +174,7 @@ func (h *RegistrationHandler) Register(c *gin.Context) {
 		Email:        req.Email,
 		PasswordHash: passwordHash,
 		WalletAddr:   walletAddr,
+		DisplayName:  strings.TrimSpace(req.DisplayName),
 	}
 	if err := h.verificationSvc.StorePendingRegistration(c.Request.Context(), req.Email, &pending); err != nil {
 		response.InternalError(c, "failed to store pending registration")
@@ -186,6 +210,8 @@ func (h *RegistrationHandler) RegisterVerify(c *gin.Context) {
 		response.BadRequest(c, err.Error())
 		return
 	}
+	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
+	req.Code = strings.TrimSpace(req.Code)
 
 	// Verify the OTP.
 	valid, err := h.verificationSvc.VerifyOTP(c.Request.Context(), req.Email, req.Code)
@@ -220,6 +246,14 @@ func (h *RegistrationHandler) RegisterVerify(c *gin.Context) {
 	}
 	if pending.DisplayName != "" {
 		u.DisplayName = &pending.DisplayName
+	}
+	// Usernames derive from the email local-part (ada@yahoo.com → "ada",
+	// "ada-8f3k" when taken). CITEXT unique is the race backstop.
+	if username, err := user.EnsureUsername(ctx, h.userRepo, req.Email); err != nil {
+		response.InternalError(c, "failed to assign username")
+		return
+	} else {
+		u.Username = &username
 	}
 	// Store the password hash if provided.
 	if pending.PasswordHash != "" {

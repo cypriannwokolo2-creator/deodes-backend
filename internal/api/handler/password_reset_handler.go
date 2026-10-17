@@ -55,8 +55,8 @@ func (h *PasswordResetHandler) ForgotPassword(c *gin.Context) {
 	}
 	if err := h.verificationSvc.SendOTP(c.Request.Context(), req.Email); err != nil {
 		// Rate-limited sends still read as success (no enumeration oracle);
-		// mailer outages are logged, not leaked.
-		log.Warn().Err(err).Str("email", req.Email).Msg("password reset code send failed")
+		// mailer outages are logged by request ID, never with the address (M3).
+		log.Warn().Err(err).Msg("password reset code send failed")
 	}
 	response.OK(c, gin.H{"success": true, "message": "if an account exists for this email, a reset code is on its way"})
 }

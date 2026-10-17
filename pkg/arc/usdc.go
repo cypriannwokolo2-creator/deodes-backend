@@ -80,6 +80,42 @@ func ReadERC20Decimals(ctx context.Context, c *Client, usdcContract string) (uin
 	return uint8(v.Uint64()), nil
 }
 
+// nativeWeiPerUSDC converts native gas wei to USDC: Arc prices gas in USDC
+// with 18 decimals while the ERC-20 leg settles 6.
+const nativeWeiPerUSDC = 1e18
+
+// EstimateTransferFee returns the worst-case network fee in USDC for sending
+// amountHuman to `to` from sender, using the same 20% gas headroom and fee
+// quote as the send path. Callers reserve this on top of the amount so a
+// full-balance send is refused before it can revert on-chain for gas.
+func EstimateTransferFee(ctx context.Context, c *Client, usdcContract, sender, to, amountHuman string) (float64, error) {
+	if strings.TrimSpace(usdcContract) == "" {
+		return 0, fmt.Errorf("arc usdc contract address is not configured")
+	}
+	toAddr, err := MustHexToAddress(to)
+	if err != nil {
+		return 0, err
+	}
+	amount, err := ParseUSDC(amountHuman)
+	if err != nil {
+		return 0, err
+	}
+	gas, err := c.EstimateGas(ctx, sender, usdcContract, encodeTransfer(toAddr, amount))
+	if err != nil {
+		return 0, err
+	}
+	gas += gas / 5
+	fees, err := QuoteFees(ctx, c)
+	if err != nil {
+		return 0, err
+	}
+	costWei := new(big.Int).Mul(new(big.Int).SetUint64(gas), fees.MaxFeePerGas)
+	cost, _ := new(big.Float).Quo(
+		new(big.Float).SetInt(costWei), big.NewFloat(nativeWeiPerUSDC),
+	).Float64()
+	return cost, nil
+}
+
 // USDCTransfer sends amountHuman USDC from privKey to `to`, returning the tx
 // hash. It verifies chain ID first (testnet keys can never spend on mainnet),
 // uses pending-nonce, estimated gas, and floored fees. Amounts parse exactly;
@@ -89,7 +125,7 @@ func USDCTransfer(ctx context.Context, c *Client, usdcContract string, privKey [
 		return "", fmt.Errorf("arc usdc contract address is not configured")
 	}
 	if _, err := c.ChainID(ctx); err != nil {
-		return "", err
+		return "", fmt.Errorf("checking Arc chain: %w", err)
 	}
 	toAddr, err := MustHexToAddress(to)
 	if err != nil {
@@ -111,17 +147,17 @@ func USDCTransfer(ctx context.Context, c *Client, usdcContract string, privKey [
 	}
 	nonce, err := c.PendingNonce(ctx, sender)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("reading sender nonce: %w", err)
 	}
 	gas, err := c.EstimateGas(ctx, sender, usdcContract, data)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("estimating gas: %w", err)
 	}
 	// 20% headroom on the estimate; ERC-20 transfers are deterministic.
 	gas = gas + gas/5
 	fees, err := QuoteFees(ctx, c)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("quoting fees: %w", err)
 	}
 	tx := &EIP1559Tx{
 		ChainID:              new(big.Int).SetUint64(c.chainID),
@@ -135,7 +171,11 @@ func USDCTransfer(ctx context.Context, c *Client, usdcContract string, privKey [
 	}
 	rawTx, _, err := tx.Sign(privKey)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("signing transfer: %w", err)
 	}
-	return c.SendRawTransaction(ctx, rawTx)
+	hash, err := c.SendRawTransaction(ctx, rawTx)
+	if err != nil {
+		return "", fmt.Errorf("broadcasting transfer: %w", err)
+	}
+	return hash, nil
 }

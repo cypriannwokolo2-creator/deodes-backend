@@ -23,6 +23,11 @@ type Community struct {
 	CreatedAt   time.Time      `json:"createdAt" db:"created_at"`
 	UpdatedAt   time.Time      `json:"updatedAt" db:"updated_at"`
 	DeletedAt   *time.Time     `json:"deletedAt,omitempty" db:"deleted_at"`
+	// SuspendedAt/Reason are admin moderation state: a suspended community
+	// is hidden from public listing and frozen (no joins, edits, or new
+	// circles) until unsuspended. Deleted (banned) rows stay deleted.
+	SuspendedAt     *time.Time `json:"suspendedAt,omitempty" db:"suspended_at"`
+	SuspendedReason *string    `json:"suspendedReason,omitempty" db:"suspended_reason"`
 }
 
 type CommunityMember struct {
@@ -30,6 +35,10 @@ type CommunityMember struct {
 	UserID      uuid.UUID `json:"userId" db:"user_id"`
 	Role        string    `json:"role" db:"role"`
 	JoinedAt    time.Time `json:"joinedAt" db:"joined_at"`
+	// Username/DisplayName are joined from users for display — never written
+	// through this struct.
+	Username    *string `json:"username,omitempty" db:"-"`
+	DisplayName *string `json:"displayName,omitempty" db:"-"`
 }
 
 type Announcement struct {

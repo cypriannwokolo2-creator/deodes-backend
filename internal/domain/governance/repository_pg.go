@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -131,7 +132,7 @@ func (r *pgRepository) GetProposal(ctx context.Context, id uuid.UUID) (*Proposal
 	return &p, nil
 }
 
-func (r *pgRepository) ListProposals(ctx context.Context, page, limit int) ([]Proposal, int, error) {
+func (r *pgRepository) ListProposals(ctx context.Context, page, limit int, search string) ([]Proposal, int, error) {
 	if page <= 0 {
 		page = 1
 	}
@@ -144,18 +145,26 @@ func (r *pgRepository) ListProposals(ctx context.Context, page, limit int) ([]Pr
 	offset := (page - 1) * limit
 
 	var total int
-	err := r.db.GetContext(ctx, &total, `SELECT COUNT(*) FROM governance_proposals`)
+	countQuery := `SELECT COUNT(*) FROM governance_proposals`
+	listFilter := ""
+	var filterArgs []interface{}
+	if search = strings.TrimSpace(search); search != "" {
+		listFilter = ` WHERE title ILIKE $1 OR description ILIKE $1`
+		filterArgs = append(filterArgs, "%"+search+"%")
+	}
+	err := r.db.GetContext(ctx, &total, countQuery+listFilter, filterArgs...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("counting governance proposals: %w", err)
 	}
 
 	query := `SELECT ` + proposalColumns + `
-		FROM governance_proposals
+		FROM governance_proposals` + listFilter + `
 		ORDER BY created_at DESC
-		LIMIT $1 OFFSET $2
+		LIMIT $%d OFFSET $%d
 	`
 	var proposals []Proposal
-	err = r.db.SelectContext(ctx, &proposals, query, limit, offset)
+	queryArgs := append(filterArgs, limit, offset)
+	err = r.db.SelectContext(ctx, &proposals, fmt.Sprintf(query, len(filterArgs)+1, len(filterArgs)+2), queryArgs...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("listing governance proposals: %w", err)
 	}

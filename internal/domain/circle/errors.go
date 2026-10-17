@@ -15,4 +15,5 @@ var (
 	ErrParticipantLimit   = errors.New("circle must have at least 2 members")
 	ErrNotCommunityMember = errors.New("user is not a member of this community")
 	ErrInvalidUUID        = errors.New("invalid UUID format")
+	ErrInsufficientFunds  = errors.New("wallet balance is below the first contribution")
 )

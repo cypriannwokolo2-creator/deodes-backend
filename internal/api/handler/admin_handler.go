@@ -14,8 +14,10 @@ import (
 	"github.com/deodes/backend/internal/domain/admin"
 	"github.com/deodes/backend/internal/domain/audit"
 	"github.com/deodes/backend/internal/domain/circle"
+	"github.com/deodes/backend/internal/domain/community"
 	"github.com/deodes/backend/internal/domain/featureflag"
 	"github.com/deodes/backend/internal/domain/user"
+	"github.com/deodes/backend/internal/domain/wallet"
 	"github.com/deodes/backend/pkg/apperrors"
 	"github.com/deodes/backend/pkg/pagination"
 	"github.com/deodes/backend/pkg/response"
@@ -30,6 +32,10 @@ type AdminHandler struct {
 	metricsSvc     *admin.Service
 	featureFlagSvc featureflag.Service
 	flagCache      *featureflag.Cache
+	// communityService and walletRepo are attached via options for the
+	// moderation endpoints (nil-safe: those endpoints report unconfigured).
+	communityService community.Service
+	walletRepo       wallet.Repository
 }
 
 func NewAdminHandler(userSvc user.Service, userRepo user.Repository, circleSvc circle.Service, auditRepo audit.Repository, metricsSvc *admin.Service, featureFlagSvc featureflag.Service, flagCache *featureflag.Cache) *AdminHandler {
@@ -391,6 +397,23 @@ func (h *AdminHandler) UpdateFeatureFlag(c *gin.Context) {
 		_ = h.flagCache.Refresh(c.Request.Context())
 	}
 
+	// T030: platform flag mutations are audited like the other admin writes.
+	if h.auditRepo != nil {
+		callerUID, _ := uuid.Parse(c.GetString("userID"))
+		details, _ := json.Marshal(map[string]any{"flag": req.Flag, "value": req.Value})
+		_ = h.auditRepo.Log(c.Request.Context(), &audit.AuditEntry{
+			ID:           uuid.New(),
+			ActorID:      callerUID,
+			Action:       "admin.feature_flag.update",
+			ResourceType: "feature_flag",
+			ResourceID:   sql.NullString{String: req.Flag, Valid: req.Flag != ""},
+			Details:      details,
+			IPAddress:    sql.NullString{String: c.ClientIP(), Valid: c.ClientIP() != ""},
+			UserAgent:    sql.NullString{String: c.Request.UserAgent(), Valid: c.Request.UserAgent() != ""},
+			CreatedAt:    time.Now().UTC(),
+		})
+	}
+
 	response.OK(c, gin.H{"flag": f})
 }
 
@@ -416,6 +439,20 @@ func (h *AdminHandler) DeleteFeatureFlag(c *gin.Context) {
 
 	if h.flagCache != nil {
 		_ = h.flagCache.Refresh(c.Request.Context())
+	}
+
+	if h.auditRepo != nil {
+		callerUID, _ := uuid.Parse(c.GetString("userID"))
+		_ = h.auditRepo.Log(c.Request.Context(), &audit.AuditEntry{
+			ID:           uuid.New(),
+			ActorID:      callerUID,
+			Action:       "admin.feature_flag.delete",
+			ResourceType: "feature_flag",
+			ResourceID:   sql.NullString{String: flag, Valid: flag != ""},
+			IPAddress:    sql.NullString{String: c.ClientIP(), Valid: c.ClientIP() != ""},
+			UserAgent:    sql.NullString{String: c.Request.UserAgent(), Valid: c.Request.UserAgent() != ""},
+			CreatedAt:    time.Now().UTC(),
+		})
 	}
 
 	response.OK(c, gin.H{"deleted": flag})

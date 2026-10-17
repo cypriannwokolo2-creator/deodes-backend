@@ -82,6 +82,7 @@ func TestEmailConsistency_RegisterStoresHashedEmail(t *testing.T) {
 	walletAddr := emailWalletAddrForTest(testAddr)
 
 	env.mockUserRepo.On("FindByWalletAddress", mock.Anything, walletAddr).Return(nil, apperrors.ErrNotFound)
+	env.mockUserRepo.On("FindByEmail", mock.Anything, testAddr).Return(nil, apperrors.ErrNotFound)
 
 	r := gin.New()
 	r.POST("/auth/register", env.h.Register)
@@ -105,6 +106,7 @@ func TestEmailConsistency_RegisterStoresHashedEmail(t *testing.T) {
 		Run(func(args mock.Arguments) {
 			storedUser = args.Get(1).(*user.User)
 		}).Return(nil)
+	env.mockUserRepo.On("FindByUsername", mock.Anything, mock.AnythingOfType("string")).Return(nil, apperrors.ErrNotFound)
 	env.mockUserRepo.On("FindByWalletAddress", mock.Anything, walletAddr).Return(nil, apperrors.ErrNotFound)
 	env.mockAuthSvc.On("CreateSession",
 		mock.Anything, mock.AnythingOfType("uuid.UUID"),

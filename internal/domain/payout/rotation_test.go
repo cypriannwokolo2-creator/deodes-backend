@@ -18,6 +18,7 @@ import (
 // stubRotationCircleService wires membership + circle lookups for rotation
 // tests; every other circle.Service method is unused and panics.
 type stubRotationCircleService struct {
+	circle.Service
 	circ   *circle.Circle
 	member bool
 }
@@ -66,6 +67,10 @@ func (s *stubRotationCircleService) GetMembers(context.Context, string) ([]circl
 	panic("not used")
 }
 
+func (s *stubRotationCircleService) SearchMembers(context.Context, string, string) ([]circle.CircleMember, error) {
+	panic("not used")
+}
+
 func (s *stubRotationCircleService) RemoveMember(context.Context, string, string, string, string) error {
 	panic("not used")
 }
@@ -102,7 +107,7 @@ func rotationTestCircle() *circle.Circle {
 	return &circle.Circle{
 		ID: uuid.New(), Name: "Rotation Circle",
 		Status: circle.CircleStatusActive, PayoutType: circle.PayoutTypeRandom,
-		CurrentRound: 5, MaxMembers: 4,
+		CurrentRound: 5, MaxMembers: 4, ContributionAmount: 200,
 	}
 }
 

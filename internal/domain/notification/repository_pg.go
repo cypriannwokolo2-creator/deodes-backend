@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
@@ -18,6 +19,12 @@ type pgRepo struct {
 
 func NewRepository(db *sqlx.DB) Repository {
 	return &pgRepo{db: db}
+}
+
+// dbNotificationType maps dotted Go constants (transfer.confirmed) to the
+// underscore labels of the notification_type enum (transfer_confirmed).
+func dbNotificationType(t NotificationType) NotificationType {
+	return NotificationType(strings.ReplaceAll(string(t), ".", "_"))
 }
 
 func scanNotification(row interface{ Scan(...interface{}) error }) (*Notification, error) {
@@ -35,6 +42,11 @@ func scanNotification(row interface{ Scan(...interface{}) error }) (*Notificatio
 }
 
 func (r *pgRepo) Create(ctx context.Context, n *Notification) error {
+	// The notification_type enum uses underscores (circle_created) while the
+	// Go constants use dots (circle.created). Normalize on write so every
+	// caller persists successfully; readers and the frontend already use the
+	// stored underscore form.
+	n.Type = dbNotificationType(n.Type)
 	query := `INSERT INTO notifications (id, user_id, type, title, body, data, is_read, is_archived, channel, created_at)
 		VALUES (:id, :user_id, :type, :title, :body, :data, :is_read, :is_archived, :channel, :created_at)`
 	_, err := r.db.NamedExecContext(ctx, query, n)

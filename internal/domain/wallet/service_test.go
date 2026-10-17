@@ -184,20 +184,38 @@ func (f *fakeArcRPC) handler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, `{"jsonrpc":"2.0","id":1,"result":%s}`, result)
 }
 
-// stubRepo is an in-memory Repository for send/balance tests.
+// stubRepo is an in-memory Repository for send/balance tests. Like the
+// production pgRepo, FindByUserID omits the encrypted secret columns while
+// FindByID returns the full secret-bearing row.
 type stubRepo struct {
-	wallets   []Wallet
-	allowed   bool
-	audited   []*WithdrawalRecord
-	createErr error
+	wallets     []Wallet
+	allowed     bool
+	audited     []*WithdrawalRecord
+	createErr   error
+	findByIDErr error
+	claimedTxns map[string]bool
 }
 
 func (s *stubRepo) Create(ctx context.Context, w *Wallet) error { return s.createErr }
 func (s *stubRepo) FindByID(ctx context.Context, id string) (*Wallet, error) {
-	return nil, fmt.Errorf("not found")
+	if s.findByIDErr != nil {
+		return nil, s.findByIDErr
+	}
+	for i := range s.wallets {
+		if s.wallets[i].ID == id {
+			return &s.wallets[i], nil
+		}
+	}
+	return nil, fmt.Errorf("finding wallet by id: %w", sql.ErrNoRows)
 }
 func (s *stubRepo) FindByUserID(ctx context.Context, userID string) ([]Wallet, error) {
-	return s.wallets, nil
+	out := make([]Wallet, 0, len(s.wallets))
+	for _, w := range s.wallets {
+		w.EncryptedSecretKey = nil
+		w.EncryptionNonce = nil
+		out = append(out, w)
+	}
+	return out, nil
 }
 func (s *stubRepo) FindByPublicKey(ctx context.Context, publicKey string) (*Wallet, error) {
 	for i := range s.wallets {
@@ -219,6 +237,63 @@ func (s *stubRepo) GetDailySpending(ctx context.Context, userID uuid.UUID) (floa
 func (s *stubRepo) RecordWithdrawalAudit(ctx context.Context, rec *WithdrawalRecord) error {
 	s.audited = append(s.audited, rec)
 	return nil
+}
+func (s *stubRepo) FindWithdrawalAuditByTxHash(ctx context.Context, txHash string) (*WithdrawalRecord, error) {
+	for _, r := range s.audited {
+		if r.TxHash == txHash {
+			return r, nil
+		}
+	}
+	return nil, nil
+}
+func (s *stubRepo) ClaimTransferOutcomeNotification(ctx context.Context, txHash string) (*WithdrawalRecord, error) {
+	if s.claimedTxns == nil {
+		s.claimedTxns = map[string]bool{}
+	}
+	if s.claimedTxns[txHash] {
+		return nil, nil
+	}
+	for _, r := range s.audited {
+		if r.TxHash == txHash {
+			s.claimedTxns[txHash] = true
+			return r, nil
+		}
+	}
+	return nil, nil
+}
+func (s *stubRepo) FreezeByUserID(ctx context.Context, userID uuid.UUID, frozen bool, reason string) (*Wallet, error) {
+	for i := range s.wallets {
+		if s.wallets[i].UserID == userID.String() && s.wallets[i].WalletType == WalletTypeHosted {
+			s.wallets[i].Frozen = frozen
+			s.wallets[i].FrozenReason = reason
+			return &s.wallets[i], nil
+		}
+	}
+	return nil, nil
+}
+func (s *stubRepo) ListFrozen(ctx context.Context) ([]Wallet, error) {
+	var out []Wallet
+	for _, w := range s.wallets {
+		if w.Frozen {
+			out = append(out, w)
+		}
+	}
+	return out, nil
+}
+func (s *stubRepo) ListWithdrawalsByUser(ctx context.Context, userID uuid.UUID, limit int) ([]WithdrawalRecord, error) {
+	var out []WithdrawalRecord
+	for _, r := range s.audited {
+		if r != nil && r.UserID == userID {
+			out = append(out, *r)
+		}
+	}
+	if out == nil {
+		out = []WithdrawalRecord{}
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
 }
 
 const (
@@ -294,7 +369,14 @@ func TestSendPayment_Validation(t *testing.T) {
 }
 
 func TestSendPayment_RateLimited(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc((&fakeArcRPC{t: t, balance: `"0x0"`}).handler))
+	// 6.0 USDC covers the 5.0 send plus the ~0.0016 network fee so the
+	// request reaches the rate limiter instead of the balance pre-check.
+	bal := new(big.Int)
+	bal.SetString("6000000", 10)
+	srv := httptest.NewServer(http.HandlerFunc((&fakeArcRPC{
+		t:       t,
+		balance: fmt.Sprintf(`"0x%064x"`, bal),
+	}).handler))
 	defer srv.Close()
 	repo := &stubRepo{wallets: []Wallet{newHostedWalletFixture(t)}, allowed: false}
 	svc := newArcTestService(t, srv.URL, repo)
@@ -316,6 +398,172 @@ func TestSendPayment_NoHostedWallet(t *testing.T) {
 	assert.ErrorContains(t, err, "no hosted Arc wallet")
 }
 
+// The wallet list never carries key material (like prod FindByUserID), so a
+// send must re-fetch the secret-bearing row: if that load fails the error
+// must say so instead of the misleading "no encrypted secret key".
+func TestSendPayment_SecretRefetchFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc((&fakeArcRPC{t: t, balance: `"0x0"`}).handler))
+	defer srv.Close()
+	repo := &stubRepo{
+		wallets:     []Wallet{newHostedWalletFixture(t)},
+		allowed:     true,
+		findByIDErr: fmt.Errorf("connection reset"),
+	}
+	svc := newArcTestService(t, srv.URL, repo)
+
+	_, err := svc.SendPayment(context.Background(), "11111111-1111-1111-1111-111111111111", nil,
+		"0x742d35Cc6634C0532925a3b844Bc454e4438f44e", "USDC", 5, "", "", "")
+	assert.ErrorContains(t, err, "loading hosted wallet for send")
+}
+
+// A full-balance send must be refused before broadcast: Arc charges gas in
+// USDC from the same balance, so amount-only sufficiency lets it through to
+// revert on-chain (burning the fee). Fake fee: 78000 gas * 20 Gwei floor =
+// 0.00156 USDC.
+func TestSendPayment_ReservesNetworkFee(t *testing.T) {
+	bal := new(big.Int)
+	bal.SetString("5000000", 10) // exactly 5.0 USDC
+	srv := httptest.NewServer(http.HandlerFunc((&fakeArcRPC{
+		t:       t,
+		balance: fmt.Sprintf(`"0x%064x"`, bal),
+	}).handler))
+	defer srv.Close()
+	repo := &stubRepo{wallets: []Wallet{newHostedWalletFixture(t)}, allowed: true}
+	svc := newArcTestService(t, srv.URL, repo)
+
+	_, err := svc.SendPayment(context.Background(), "11111111-1111-1111-1111-111111111111", nil,
+		"0x742d35Cc6634C0532925a3b844Bc454e4438f44e", "USDC", 5, "", "", "")
+	assert.ErrorContains(t, err, "insufficient wallet balance")
+	assert.ErrorContains(t, err, "plus ~0.0016 USDC network fee")
+	require.Len(t, repo.audited, 1, "refused sends are audit-trailed")
+	assert.Equal(t, "failed", repo.audited[0].Status)
+	assert.Contains(t, repo.audited[0].Failure, "insufficient balance")
+}
+
+// A balance read failure must fail the send closed: proceeding blind turns
+// into an on-chain revert that still burns gas.
+func TestSendPayment_BalanceReadFailureFailsClosed(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Method string `json:"method"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		w.Header().Set("Content-Type", "application/json")
+		if req.Method == "eth_call" {
+			fmt.Fprint(w, `{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"node overloaded"}}`)
+			return
+		}
+		result := `"0x0"`
+		switch req.Method {
+		case "eth_chainId":
+			result = `"0x4cef52"`
+		case "eth_estimateGas":
+			result = `"0xfde8"`
+		case "eth_getBlockByNumber":
+			result = `{"baseFeePerGas":"0x3b9aca00"}`
+		}
+		fmt.Fprintf(w, `{"jsonrpc":"2.0","id":1,"result":%s}`, result)
+	}))
+	defer srv.Close()
+	repo := &stubRepo{wallets: []Wallet{newHostedWalletFixture(t)}, allowed: true}
+	svc := newArcTestService(t, srv.URL, repo)
+
+	_, err := svc.SendPayment(context.Background(), "11111111-1111-1111-1111-111111111111", nil,
+		"0x742d35Cc6634C0532925a3b844Bc454e4438f44e", "USDC", 1, "", "", "")
+	assert.ErrorContains(t, err, "could not verify wallet balance")
+	require.Len(t, repo.audited, 1, "unverified sends are audit-trailed, never broadcast")
+	assert.Equal(t, "failed", repo.audited[0].Status)
+}
+
+// Amounts that floor to zero base units must be rejected before broadcast:
+// sending them would burn gas moving nothing.
+func TestSendPayment_DustAmountRejected(t *testing.T) {
+	bal := new(big.Int)
+	bal.SetString("5000000", 10)
+	srv := httptest.NewServer(http.HandlerFunc((&fakeArcRPC{
+		t:       t,
+		balance: fmt.Sprintf(`"0x%064x"`, bal),
+	}).handler))
+	defer srv.Close()
+	repo := &stubRepo{wallets: []Wallet{newHostedWalletFixture(t)}, allowed: true}
+	svc := newArcTestService(t, srv.URL, repo)
+
+	_, err := svc.SendPayment(context.Background(), "11111111-1111-1111-1111-111111111111", nil,
+		"0x742d35Cc6634C0532925a3b844Bc454e4438f44e", "USDC", 0.0000001, "", "", "")
+	assert.ErrorContains(t, err, "too small")
+	require.Len(t, repo.audited, 1)
+	assert.Equal(t, "failed", repo.audited[0].Status)
+}
+
+// A frozen hosted wallet rejects before any chain or key touch, and the
+// attempt is audit-trailed.
+func TestSendPayment_FrozenWalletRejected(t *testing.T) {
+	w := newHostedWalletFixture(t)
+	w.Frozen = true
+	w.FrozenReason = "suspicious activity"
+	bal := new(big.Int)
+	bal.SetString("5000000", 10)
+	srv := httptest.NewServer(http.HandlerFunc((&fakeArcRPC{
+		t:       t,
+		balance: fmt.Sprintf(`"0x%064x"`, bal),
+	}).handler))
+	defer srv.Close()
+	repo := &stubRepo{wallets: []Wallet{w}, allowed: true}
+	svc := newArcTestService(t, srv.URL, repo)
+
+	_, err := svc.SendPayment(context.Background(), "11111111-1111-1111-1111-111111111111", nil,
+		"0x742d35Cc6634C0532925a3b844Bc454e4438f44e", "USDC", 1, "", "", "")
+	assert.ErrorIs(t, err, ErrWalletFrozen)
+	require.Len(t, repo.audited, 1)
+	assert.Equal(t, "failed", repo.audited[0].Status)
+}
+
+func TestCheckTransferSettlement(t *testing.T) {
+	receiptServer := func(t *testing.T, body string) *httptest.Server {
+		t.Helper()
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, body)
+		}))
+	}
+	newSvc := func(t *testing.T, url string) Service {
+		t.Helper()
+		svc, err := NewService(nil, Config{ArcRPCURL: url, ArcChainID: 5042})
+		require.NoError(t, err)
+		return svc
+	}
+	mk := func(status string) string {
+		return fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"result":{"transactionHash":"0xabc","blockNumber":"0x10","to":"0x3600","status":%q}}`, status)
+	}
+	ctx := context.Background()
+
+	srv := receiptServer(t, mk("0x1"))
+	defer srv.Close()
+	confirmed, reverted := newSvc(t, srv.URL).CheckTransferSettlement(ctx, "0xabc")
+	assert.True(t, confirmed)
+	assert.False(t, reverted)
+
+	srv2 := receiptServer(t, mk("0x0"))
+	defer srv2.Close()
+	confirmed, reverted = newSvc(t, srv2.URL).CheckTransferSettlement(ctx, "0xabc")
+	assert.False(t, confirmed)
+	assert.True(t, reverted)
+
+	srv3 := receiptServer(t, `{"jsonrpc":"2.0","id":1,"result":null}`)
+	defer srv3.Close()
+	confirmed, reverted = newSvc(t, srv3.URL).CheckTransferSettlement(ctx, "0xabc")
+	assert.False(t, confirmed)
+	assert.False(t, reverted)
+
+	confirmed, reverted = newSvc(t, "http://127.0.0.1:1").CheckTransferSettlement(ctx, "0xabc")
+	assert.False(t, confirmed)
+	assert.False(t, reverted)
+
+	confirmed, reverted = newSvc(t, srv.URL).CheckTransferSettlement(ctx, "")
+	assert.False(t, confirmed)
+	assert.False(t, reverted)
+}
+
 func TestGetBalance_HostedArc(t *testing.T) {
 	bal := new(big.Int)
 	bal.SetString("2500000", 10) // 2.5 USDC in ERC-20 base units (6 decimals)
@@ -330,7 +578,6 @@ func TestGetBalance_HostedArc(t *testing.T) {
 	b, err := svc.GetBalance(context.Background(), "u1")
 	require.NoError(t, err)
 	assert.Equal(t, 2.5, b.USDC)
-	assert.Equal(t, 0.0, b.XLM)
 }
 
 func TestLinkWallet_PersistsSelfCustodyRecord(t *testing.T) {

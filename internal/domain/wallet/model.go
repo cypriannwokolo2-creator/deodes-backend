@@ -24,9 +24,8 @@ const (
 	WalletTypeLinked WalletType = "linked"
 )
 
-// Balance represents the available XLM and USDC balances for a wallet.
+// Balance is the available USDC balance (Arc EVM) for a wallet.
 type Balance struct {
-	XLM  float64 `json:"xlm"`
 	USDC float64 `json:"usdc"`
 }
 
@@ -38,8 +37,12 @@ type Wallet struct {
 	EncryptionNonce    []byte     `json:"-" db:"encryption_nonce"`
 	WalletType         WalletType `json:"walletType" db:"wallet_type"`
 	IsPrimary          bool       `json:"isPrimary" db:"is_primary"`
-	CreatedAt          string     `json:"createdAt" db:"created_at"`
-	UpdatedAt          string     `json:"updatedAt" db:"updated_at"`
+	// Frozen is admin moderation state: a frozen wallet cannot send (all
+	// outbound flows reject), while inbound deposits are unaffected.
+	Frozen       bool   `json:"isFrozen" db:"frozen"`
+	FrozenReason string `json:"frozenReason,omitempty" db:"frozen_reason"`
+	CreatedAt    string `json:"createdAt" db:"created_at"`
+	UpdatedAt    string `json:"updatedAt" db:"updated_at"`
 }
 
 // DecryptSecret decrypts the wallet's AES-256-GCM encrypted secret key using

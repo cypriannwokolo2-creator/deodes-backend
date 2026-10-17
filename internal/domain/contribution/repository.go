@@ -12,6 +12,7 @@ type Repository interface {
 	// FindByTxnHash returns the existing contribution for a given on-chain
 	// transaction hash. Used for idempotent replay detection.
 	FindByTxnHash(ctx context.Context, txnHash string) (*Contribution, error)
+	FindByCircleUserRound(ctx context.Context, circleID, userID uuid.UUID, round int) (*Contribution, error)
 	Create(ctx context.Context, c *Contribution) error
 	UpdateStatus(ctx context.Context, id uuid.UUID, status ContributionStatus, txnHash string) error
 	UpdateVerificationStatus(ctx context.Context, id uuid.UUID, verifiedOnchain bool, status VerificationStatus) error

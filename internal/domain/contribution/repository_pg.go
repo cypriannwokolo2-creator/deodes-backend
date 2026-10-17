@@ -61,6 +61,12 @@ func (r *pgRepo) FindByCircleAndUser(ctx context.Context, circleID, userID uuid.
 	return scanContribution(r.db.QueryRowxContext(ctx, query, circleID, userID))
 }
 
+func (r *pgRepo) FindByCircleUserRound(ctx context.Context, circleID, userID uuid.UUID, round int) (*Contribution, error) {
+	query := `SELECT id, circle_id, user_id, round_number, amount, txn_hash, status, on_time, verified_onchain, verification_status, created_at, updated_at
+		FROM contributions WHERE circle_id = $1 AND user_id = $2 AND round_number = $3 LIMIT 1`
+	return scanContribution(r.db.QueryRowxContext(ctx, query, circleID, userID, round))
+}
+
 func (r *pgRepo) FindByTxnHash(ctx context.Context, txnHash string) (*Contribution, error) {
 	query := `SELECT id, circle_id, user_id, round_number, amount, txn_hash, status, on_time, verified_onchain, verification_status, created_at, updated_at
 		FROM contributions WHERE txn_hash = $1 LIMIT 1`

@@ -24,10 +24,12 @@ func NewRepository(db *sqlx.DB) Repository {
 // userColumns is the canonical projection for reading a user. Every lookup
 // shares it so a column added here is picked up everywhere at once, and the
 // scan order below matches it exactly.
-const userColumns = `id, wallet_address, email, phone, display_name, avatar_ipfs_hash,
+const userColumns = `id, wallet_address, email, username, phone, display_name, avatar_ipfs_hash,
 		country_code, preferred_language, moi_score, role,
 		session_ttl_minutes, password_hash, totp_secret, totp_enabled, backup_codes, email_verified, passkey_credential_id,
 		notification_channels, notifications_muted, digest_enabled, digest_interval_minutes, push_token,
+		savings_auto_reserve, savings_default_target, savings_default_frequency,
+		savings_notify_on_milestone, savings_milestone_threshold, preferred_currency,
 		created_at, updated_at, deleted_at`
 
 // scanUser reads the userColumns projection. deleted_at is read into the
@@ -35,12 +37,13 @@ const userColumns = `id, wallet_address, email, phone, display_name, avatar_ipfs
 // always NULL on the paths that filter on deleted_at IS NULL.
 func scanUser(row interface{ Scan(...interface{}) error }) (*User, error) {
 	var u User
-	var email, phone, displayName, avatarIpfsHash, countryCode, passkeyCredentialID, totpSecret, passwordHash, pushToken sql.NullString
+	var email, username, phone, displayName, avatarIpfsHash, countryCode, passkeyCredentialID, totpSecret, passwordHash, pushToken sql.NullString
 	var deletedAt sql.NullTime
 	err := row.Scan(
 		&u.ID,
 		&u.WalletAddress,
 		&email,
+		&username,
 		&phone,
 		&displayName,
 		&avatarIpfsHash,
@@ -60,6 +63,12 @@ func scanUser(row interface{ Scan(...interface{}) error }) (*User, error) {
 		&u.DigestEnabled,
 		&u.DigestIntervalMinutes,
 		&pushToken,
+		&u.SavingsAutoReserve,
+		&u.SavingsDefaultTarget,
+		&u.SavingsDefaultFrequency,
+		&u.SavingsNotifyOnMilestone,
+		&u.SavingsMilestoneThreshold,
+		&u.PreferredCurrency,
 		&u.CreatedAt,
 		&u.UpdatedAt,
 		&deletedAt,
@@ -72,6 +81,9 @@ func scanUser(row interface{ Scan(...interface{}) error }) (*User, error) {
 	}
 	if email.Valid {
 		u.Email = &email.String
+	}
+	if username.Valid {
+		u.Username = &username.String
 	}
 	if phone.Valid {
 		u.Phone = &phone.String
@@ -120,6 +132,11 @@ func (r *pgRepo) FindByEmail(ctx context.Context, email string) (*User, error) {
 	return scanUser(r.db.QueryRowxContext(ctx, query, hashedEmail))
 }
 
+func (r *pgRepo) FindByUsername(ctx context.Context, username string) (*User, error) {
+	query := `SELECT ` + userColumns + ` FROM users WHERE username = $1 AND deleted_at IS NULL`
+	return scanUser(r.db.QueryRowxContext(ctx, query, username))
+}
+
 func (r *pgRepo) FindByPasskeyCredentialID(ctx context.Context, credentialID string) (*User, error) {
 	query := `SELECT ` + userColumns + ` FROM users WHERE passkey_credential_id = $1 AND deleted_at IS NULL`
 	return scanUser(r.db.QueryRowxContext(ctx, query, credentialID))
@@ -134,11 +151,11 @@ func (r *pgRepo) FindByIDIncludingDeleted(ctx context.Context, id uuid.UUID) (*U
 }
 
 func (r *pgRepo) Create(ctx context.Context, u *User) error {
-	query := `INSERT INTO users (id, wallet_address, email, phone, display_name,
+	query := `INSERT INTO users (id, wallet_address, email, username, phone, display_name,
 		avatar_ipfs_hash, country_code, preferred_language,
 		moi_score, role, session_ttl_minutes, password_hash, totp_secret, totp_enabled, backup_codes, email_verified, passkey_credential_id,
 		created_at, updated_at)
-		VALUES (:id, :wallet_address, :email, :phone, :display_name,
+		VALUES (:id, :wallet_address, :email, :username, :phone, :display_name,
 		:avatar_ipfs_hash, :country_code, :preferred_language,
 		:moi_score, :role, :session_ttl_minutes, :password_hash, :totp_secret, :totp_enabled, :backup_codes, :email_verified, :passkey_credential_id,
 		:created_at, :updated_at)`
@@ -153,7 +170,7 @@ func (r *pgRepo) Create(ctx context.Context, u *User) error {
 }
 
 func (r *pgRepo) Update(ctx context.Context, u *User) error {
-	query := `UPDATE users SET email = :email, phone = :phone, display_name = :display_name,
+	query := `UPDATE users SET email = :email, username = :username, phone = :phone, display_name = :display_name,
 		avatar_ipfs_hash = :avatar_ipfs_hash,
 		country_code = :country_code, preferred_language = :preferred_language, moi_score = :moi_score,
 		role = :role, session_ttl_minutes = :session_ttl_minutes, password_hash = :password_hash,
@@ -162,6 +179,11 @@ func (r *pgRepo) Update(ctx context.Context, u *User) error {
 		passkey_credential_id = :passkey_credential_id,
 		notification_channels = :notification_channels, notifications_muted = :notifications_muted,
 		digest_enabled = :digest_enabled, digest_interval_minutes = :digest_interval_minutes,
+		savings_auto_reserve = :savings_auto_reserve, savings_default_target = :savings_default_target,
+		savings_default_frequency = :savings_default_frequency,
+		savings_notify_on_milestone = :savings_notify_on_milestone,
+		savings_milestone_threshold = :savings_milestone_threshold,
+		preferred_currency = :preferred_currency,
 		updated_at = :updated_at WHERE id = :id`
 	result, err := r.db.NamedExecContext(ctx, query, u)
 	if err != nil {

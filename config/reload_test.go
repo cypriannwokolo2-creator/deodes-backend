@@ -42,11 +42,11 @@ func TestHotReloader_AppliesWhitelistedKeys(t *testing.T) {
 func TestHotReloader_IgnoresNonWhitelistedKeys(t *testing.T) {
 	h := newTestReloader()
 
-	_, err := h.Apply(newReloadViper(t, "rate_limit:\n  fail_closed: false\n  otp_limit: 1\nserver:\n  port: 9\n"))
+	_, err := h.Apply(newReloadViper(t, "rate_limit:\n  fail_closed: false\n  otp_send_limit: 2\nserver:\n  port: 9\n"))
 	require.NoError(t, err)
 
 	require.True(t, h.RateLimit().FailClosed)
-	require.Equal(t, 0, h.RateLimit().OTPLimit)
+	require.Equal(t, 2, h.RateLimit().OTPSendLimit)
 }
 
 func TestHotReloader_InvalidConfigKeepsPreviousValues(t *testing.T) {

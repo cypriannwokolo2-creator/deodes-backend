@@ -11,9 +11,8 @@ type DailyVolumePoint struct {
 }
 
 // Metrics is the platform-wide aggregate snapshot returned by /admin/metrics.
-// Volumes are reported in the circle's native currency units (USDC/XLM) as
-// stored on-chain; totalVolumeUSD is the sum of both and is an approximation
-// until per-currency conversion rates are available.
+// Volumes are reported in Arc USDC as stored on-chain; totalVolumeUSD equals
+// the USDC volume until additional assets are supported.
 type Metrics struct {
 	TotalUsers         int                `json:"totalUsers"`
 	TotalCircles       int                `json:"totalCircles"`

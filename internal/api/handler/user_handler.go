@@ -2,11 +2,12 @@ package handler
 
 import (
 	"errors"
+	"strings"
 
-	"github.com/gin-gonic/gin"
 	"github.com/deodes/backend/internal/api/middleware"
 	"github.com/deodes/backend/internal/domain/user"
 	"github.com/deodes/backend/pkg/response"
+	"github.com/gin-gonic/gin"
 )
 
 type UserHandler struct {
@@ -73,4 +74,61 @@ func (h *UserHandler) UpdateProfile(c *gin.Context) {
 	}
 
 	response.OK(c, gin.H{"user": u})
+}
+
+// @Summary Delete own account
+// @Description Soft-deletes the authenticated user's account.
+// @Tags User
+// @Produce json
+// @Security BearerAuth
+// @Success 200 {object} response.Envelope{data=object{success=bool}}
+// @Router /users/me [delete]
+func (h *UserHandler) DeleteMe(c *gin.Context) {
+	userID := middleware.GetUserID(c)
+	if userID == "" {
+		response.Unauthorized(c, "unauthorized")
+		return
+	}
+	if err := h.userService.Delete(c.Request.Context(), userID); err != nil {
+		if errors.Is(err, user.ErrUserNotFound) {
+			response.NotFound(c, "user not found")
+			return
+		}
+		response.BadRequest(c, err.Error())
+		return
+	}
+	response.OK(c, gin.H{"success": true})
+}
+
+// @Summary Look up a Deodes user by email
+// @Description Resolves an email to the recipient preview used by internal
+// transfers (display name only — no wallet address is exposed). Requires auth.
+// @Tags User
+// @Produce json
+// @Security BearerAuth
+// @Param email query string true "Recipient email"
+// @Success 200 {object} response.Envelope{data=object{user=object}}
+// @Failure 404 {object} response.Envelope
+// @Router /users/lookup [get]
+func (h *UserHandler) LookupByEmail(c *gin.Context) {
+	email := strings.ToLower(strings.TrimSpace(c.Query("email")))
+	if email == "" || !strings.Contains(email, "@") {
+		response.BadRequest(c, "a valid email query parameter is required")
+		return
+	}
+
+	u, err := h.userService.GetByEmail(c.Request.Context(), email)
+	if err != nil {
+		response.NotFound(c, "no Deodes user found for that email")
+		return
+	}
+
+	name := ""
+	if u.DisplayName != nil {
+		name = *u.DisplayName
+	}
+	response.OK(c, gin.H{"user": gin.H{
+		"displayName":   name,
+		"emailVerified": u.EmailVerified,
+	}})
 }

@@ -67,7 +67,8 @@ func TestCommunityService_Create_NilTagsDefaultToEmpty(t *testing.T) {
 	repo.AssertExpectations(t)
 }
 
-func TestCommunityService_Create_SlugConflict(t *testing.T) {	repo := new(communityMocks.Repository)
+func TestCommunityService_Create_SlugConflict(t *testing.T) {
+	repo := new(communityMocks.Repository)
 	svc := community.NewService(repo, nil)
 	uid := uuid.New()
 
@@ -194,6 +195,8 @@ func TestCommunityService_Join_Broadcasts(t *testing.T) {
 	svc := community.NewService(repo, bc)
 	cid, uid := uuid.New(), uuid.New()
 
+	repo.On("FindByID", mock.Anything, cid).Return(&community.Community{}, nil)
+	repo.On("IsMember", mock.Anything, cid, uid).Return(false, nil)
 	repo.On("AddMember", mock.Anything, mock.AnythingOfType("*community.CommunityMember")).Return(nil)
 	bc.On("CommunityJoined", mock.Anything, cid.String(), uid.String()).Return()
 

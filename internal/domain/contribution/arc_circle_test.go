@@ -84,6 +84,7 @@ func TestContributionService_Record_AcceptsMatchingCircleContract(t *testing.T) 
 	require.NoError(t, svc.(contribution.ServiceWithCircle).SetArcCircleAddress(testConfiguredCircle))
 
 	repo.On("FindByTxnHash", ctx, "matching-txn").Return(nil, apperrors.ErrNotFound)
+	repo.On("FindByCircleUserRound", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil, apperrors.ErrNotFound)
 	repo.On("Create", ctx, mock.AnythingOfType("*contribution.Contribution")).Return(nil)
 
 	got, err := svc.Record(ctx, contribution.RecordInput{

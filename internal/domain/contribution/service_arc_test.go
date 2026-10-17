@@ -45,6 +45,7 @@ func TestContributionService_Record_ArcHashPending(t *testing.T) {
 	svc := contribution.NewService(repo, nil, nil, nil)
 	ctx := context.Background()
 	repo.On("FindByTxnHash", ctx, arcHash).Return(nil, apperrors.ErrNotFound)
+	repo.On("FindByCircleUserRound", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil, apperrors.ErrNotFound)
 	repo.On("Create", ctx, mock.MatchedBy(func(c *contribution.Contribution) bool {
 		return c.VerificationStatus == contribution.VerificationStatusPending && !c.VerifiedOnchain
 	})).Return(nil)

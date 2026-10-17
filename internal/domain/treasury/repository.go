@@ -31,7 +31,6 @@ func (r *pgRepo) GetBalance(ctx context.Context) (*TreasuryBalance, error) {
 	var balance TreasuryBalance
 	query := `
 		SELECT 
-			COALESCE(SUM(CASE WHEN asset = 'XLM' THEN amount ELSE 0 END), '0') as xlm,
 			COALESCE(SUM(CASE WHEN asset = 'USDC' THEN amount ELSE 0 END), '0') as usdc
 		FROM treasury_transactions
 		WHERE type IN ('deposit', 'fee')

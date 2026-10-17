@@ -2,6 +2,7 @@ package handler_test
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -20,6 +21,7 @@ import (
 // gateCircleStub serves the circle lookups ExitCircle and TriggerPayout need;
 // unused circle.Service methods return zero values.
 type gateCircleStub struct {
+	circle.Service
 	circ       *circle.Circle
 	members    []circle.CircleMember
 	isMember   bool
@@ -33,6 +35,19 @@ func (s *gateCircleStub) Get(context.Context, string) (*circle.Circle, error) {
 
 func (s *gateCircleStub) GetMembers(context.Context, string) ([]circle.CircleMember, error) {
 	return s.members, nil
+}
+
+func (s *gateCircleStub) SearchMembers(_ context.Context, _ string, search string) ([]circle.CircleMember, error) {
+	if search == "" {
+		return s.members, nil
+	}
+	var out []circle.CircleMember
+	for _, m := range s.members {
+		if m.Username != nil && strings.Contains(strings.ToLower(*m.Username), strings.ToLower(search)) {
+			out = append(out, m)
+		}
+	}
+	return out, nil
 }
 
 func (s *gateCircleStub) IsMember(context.Context, string, string) (bool, error) {
@@ -298,4 +313,33 @@ func TestTriggerPayout_RandomUnpaidRecipientAllowed(t *testing.T) {
 	assert.Equal(t, http.StatusCreated, w.Code)
 	require.NotNil(t, payoutSvc.recordInput)
 	assert.Equal(t, fresh.String(), payoutSvc.recordInput.RecipientID)
+}
+
+func TestTriggerPayout_VerificationFailureIs422(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	circleID := uuid.New()
+	organizer, fresh := uuid.New(), uuid.New()
+	circleSvc := &gateCircleStub{
+		circ: &circle.Circle{
+			ID: circleID, Name: "Random", Status: circle.CircleStatusActive,
+			PayoutType: circle.PayoutTypeFixed, CurrentRound: 2,
+			MaxMembers: 3, OrganizerID: organizer,
+		},
+		isMember: true,
+	}
+	payoutSvc := &gatePayoutStub{
+		recordErr: errors.New("on-chain verification failed: transaction 0xdead reverted on-chain (status 0)"),
+	}
+
+	r := gateRouter(circleSvc, payoutSvc)
+	body := `{"recipientId":"` + fresh.String() + `","roundNumber":2,"amount":300,"feeAmount":1.5,` +
+		`"txnHash":"0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef","payoutType":"fixed"}`
+	req := httptest.NewRequest(http.MethodPost, "/circles/"+circleID.String()+"/payout", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Test-User", organizer.String())
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusUnprocessableEntity, w.Code)
+	assert.Contains(t, w.Body.String(), "ONCHAIN_VERIFICATION_FAILED")
 }

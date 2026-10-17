@@ -1,6 +1,9 @@
 package handler
 
 import (
+	"strings"
+	"time"
+
 	"github.com/gin-gonic/gin"
 	"github.com/deodes/backend/internal/api/middleware"
 	"github.com/deodes/backend/internal/domain/invite"
@@ -80,4 +83,40 @@ func (h *InviteHandler) RevokeInvite(c *gin.Context) {
 		return
 	}
 	response.OK(c, gin.H{"success": true})
+}
+
+// @Summary Preview a circle invite
+// @Description Public preview backing the /invite/:code landing page: returns
+// the circle, expiry and usage counters for a valid code, 404 otherwise. No
+// auth required so signed-out recipients can review before registering. The
+// shape matches the frontend InvitePreview (ISO expiry string, never the
+// sql.NullTime object).
+// @Tags Invites
+// @Produce json
+// @Param code path string true "Invite code"
+// @Success 200 {object} response.Envelope{data=object{invite=object}}
+// @Failure 404 {object} response.Envelope
+// @Router /circles/invites/{code} [get]
+func (h *InviteHandler) Preview(c *gin.Context) {
+	code := strings.TrimSpace(c.Param("code"))
+	if code == "" {
+		response.NotFound(c, "invite not found")
+		return
+	}
+	inv, err := h.inviteService.Validate(c.Request.Context(), code)
+	if err != nil || inv == nil {
+		response.NotFound(c, "invite not found or expired")
+		return
+	}
+	var expiresAt interface{}
+	if inv.ExpiresAt.Valid {
+		expiresAt = inv.ExpiresAt.Time.UTC().Format(time.RFC3339)
+	}
+	response.OK(c, gin.H{"invite": gin.H{
+		"code":      inv.Code,
+		"circleId":  inv.CircleID.String(),
+		"expiresAt": expiresAt,
+		"useCount":  inv.UseCount,
+		"maxUses":   inv.MaxUses,
+	}})
 }

@@ -62,6 +62,11 @@ var urgentTypes = map[NotificationType]struct{}{
 	TypePayoutReceived:  {},
 	TypeCircleCompleted: {},
 	TypeDisputeRaised:   {},
+	// Money-movement outcomes are never digest-batched: the user must see
+	// them the moment they settle.
+	TypeTransferConfirmed: {},
+	TypeTransferFailed:    {},
+	TypeTransferReceived:  {},
 }
 
 // digestTypeLabels give each batchable event class a human-readable phrase for

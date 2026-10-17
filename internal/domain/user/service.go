@@ -2,8 +2,10 @@ package user
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -29,11 +31,32 @@ type Service interface {
 
 type UpdateProfileInput struct {
 	DisplayName       *string `json:"displayName"`
+	Username          *string `json:"username"`
 	Email             *string `json:"email"`
 	Phone             *string `json:"phone"`
 	CountryCode       *string `json:"countryCode"`
 	PreferredLanguage *string `json:"preferredLanguage"`
 	SessionTTL        *int    `json:"sessionTtlMinutes"`
+	AvatarIpfsHash    *string `json:"avatarIpfsHash"`
+	// Savings + currency preferences (061), written from the settings
+	// screens. All optional; nil means unchanged.
+	SavingsAutoReserve        *bool    `json:"savingsAutoReserve"`
+	SavingsDefaultTarget      *float64 `json:"savingsDefaultTarget"`
+	SavingsDefaultFrequency   *string  `json:"savingsDefaultFrequency"`
+	SavingsNotifyOnMilestone  *bool    `json:"savingsNotifyOnMilestone"`
+	SavingsMilestoneThreshold *int     `json:"savingsMilestoneThreshold"`
+	PreferredCurrency         *string  `json:"preferredCurrency"`
+}
+
+// ValidSavingsFrequencies mirrors the settings-screen options.
+var ValidSavingsFrequencies = map[string]bool{
+	"daily": true, "weekly": true, "biweekly": true, "monthly": true,
+}
+
+// ValidCurrencies is the settings-screen list. Widening it needs no
+// migration — the column is unconstrained on purpose.
+var ValidCurrencies = map[string]bool{
+	"NGN": true, "USDC": true,
 }
 
 // NotificationPrefsInput carries the user's desired notification channel
@@ -202,7 +225,33 @@ func (s *userService) UpdateProfile(ctx context.Context, id string, updates Upda
 	}
 
 	if updates.DisplayName != nil {
+		name := strings.TrimSpace(*updates.DisplayName)
+		if len([]rune(name)) < 2 || len([]rune(name)) > 60 {
+			return nil, fmt.Errorf("display name must be 2-60 characters: %w", apperrors.ErrInvalidInput)
+		}
 		u.DisplayName = updates.DisplayName
+	}
+	if updates.Username != nil {
+		name := strings.ToLower(strings.TrimSpace(*updates.Username))
+		if err := ValidateUsername(name); err != nil {
+			return nil, err
+		}
+		if u.Username == nil || *u.Username != name {
+			if _, err := s.repo.FindByUsername(ctx, name); err == nil {
+				return nil, fmt.Errorf("username is already taken: %w", apperrors.ErrConflict)
+			} else if !errors.Is(err, apperrors.ErrNotFound) {
+				return nil, fmt.Errorf("checking username availability: %w", err)
+			}
+		}
+		u.Username = &name
+	}
+	if updates.AvatarIpfsHash != nil {
+		// Resized data-URL avatars from the profile uploader, or IPFS
+		// hashes. Bounded so a profile write cannot smuggle megabytes.
+		if len(*updates.AvatarIpfsHash) > 200_000 {
+			return nil, fmt.Errorf("avatar is too large: %w", apperrors.ErrInvalidInput)
+		}
+		u.AvatarIpfsHash = updates.AvatarIpfsHash
 	}
 	if updates.Email != nil {
 		hashed := HashEmail(*updates.Email)
@@ -226,6 +275,40 @@ func (s *userService) UpdateProfile(ctx context.Context, id string, updates Upda
 			ttl = 1440
 		}
 		u.SessionTTLMinutes = ttl
+	}
+	if updates.SavingsAutoReserve != nil {
+		u.SavingsAutoReserve = *updates.SavingsAutoReserve
+	}
+	if updates.SavingsDefaultTarget != nil {
+		target := *updates.SavingsDefaultTarget
+		if target < 0 {
+			return nil, fmt.Errorf("savingsDefaultTarget must not be negative: %w", apperrors.ErrInvalidInput)
+		}
+		u.SavingsDefaultTarget = target
+	}
+	if updates.SavingsDefaultFrequency != nil {
+		freq := *updates.SavingsDefaultFrequency
+		if !ValidSavingsFrequencies[freq] {
+			return nil, fmt.Errorf("savingsDefaultFrequency must be one of daily, weekly, biweekly, monthly: %w", apperrors.ErrInvalidInput)
+		}
+		u.SavingsDefaultFrequency = freq
+	}
+	if updates.SavingsNotifyOnMilestone != nil {
+		u.SavingsNotifyOnMilestone = *updates.SavingsNotifyOnMilestone
+	}
+	if updates.SavingsMilestoneThreshold != nil {
+		th := *updates.SavingsMilestoneThreshold
+		if th != 25 && th != 50 && th != 75 && th != 100 {
+			return nil, fmt.Errorf("savingsMilestoneThreshold must be one of 25, 50, 75, 100: %w", apperrors.ErrInvalidInput)
+		}
+		u.SavingsMilestoneThreshold = th
+	}
+	if updates.PreferredCurrency != nil {
+		cur := *updates.PreferredCurrency
+		if !ValidCurrencies[cur] {
+			return nil, fmt.Errorf("preferredCurrency must be one of NGN, USDC: %w", apperrors.ErrInvalidInput)
+		}
+		u.PreferredCurrency = cur
 	}
 	u.UpdatedAt = time.Now().UTC()
 

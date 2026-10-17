@@ -44,7 +44,7 @@ func swapError(c *gin.Context, err error) {
 // @Failure      403  {object}  response.ErrorResponse
 // @Router       /v1/swap/offer [post]
 func (h *SwapHandler) CreateSwapOffer(c *gin.Context) {
-	userID, exists := c.Get("user_id")
+	userID, exists := c.Get("userID")
 	if !exists {
 		response.Unauthorized(c, "unauthorized")
 		return
@@ -84,7 +84,7 @@ func (h *SwapHandler) CreateSwapOffer(c *gin.Context) {
 // @Failure      404  {object}  response.ErrorResponse
 // @Router       /v1/swap/accept [post]
 func (h *SwapHandler) AcceptSwapOffer(c *gin.Context) {
-	userID, exists := c.Get("user_id")
+	userID, exists := c.Get("userID")
 	if !exists {
 		response.Unauthorized(c, "unauthorized")
 		return
@@ -116,7 +116,7 @@ func (h *SwapHandler) AcceptSwapOffer(c *gin.Context) {
 // @Failure      401  {object}  response.ErrorResponse
 // @Router       /v1/swap/cancel [post]
 func (h *SwapHandler) CancelSwapOffer(c *gin.Context) {
-	userID, exists := c.Get("user_id")
+	userID, exists := c.Get("userID")
 	if !exists {
 		response.Unauthorized(c, "unauthorized")
 		return
@@ -153,7 +153,7 @@ func (h *SwapHandler) CancelSwapOffer(c *gin.Context) {
 // @Failure      401  {object}  response.ErrorResponse
 // @Router       /v1/swap/history [get]
 func (h *SwapHandler) GetSwapHistory(c *gin.Context) {
-	userID, exists := c.Get("user_id")
+	userID, exists := c.Get("userID")
 	if !exists {
 		response.Unauthorized(c, "unauthorized")
 		return
@@ -164,7 +164,11 @@ func (h *SwapHandler) GetSwapHistory(c *gin.Context) {
 		limit = 20
 	}
 
+	// T050: accept page (like every other list) as well as raw offset.
 	offset, _ := strconv.Atoi(c.Query("offset"))
+	if page, _ := strconv.Atoi(c.Query("page")); page > 1 && c.Query("offset") == "" {
+		offset = (page - 1) * limit
+	}
 
 	filter := swap.SwapHistoryFilter{
 		Limit:  limit,

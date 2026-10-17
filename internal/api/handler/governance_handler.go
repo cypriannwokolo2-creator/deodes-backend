@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 
@@ -74,7 +75,7 @@ func (h *GovernanceHandler) ListProposals(c *gin.Context) {
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "10"))
 
-	proposals, total, err := h.service.ListProposals(c.Request.Context(), page, limit)
+	proposals, total, err := h.service.ListProposals(c.Request.Context(), page, limit, strings.TrimSpace(c.Query("search")))
 	if err != nil {
 		response.InternalError(c, "failed to list proposals")
 		return
@@ -111,7 +112,11 @@ func (h *GovernanceHandler) VoteProposal(c *gin.Context) {
 		response.BadRequest(c, err.Error())
 		return
 	}
-	if err := h.service.VoteProposal(c.Request.Context(), c.Param("id"), userID, input.Vote); err != nil {
+	if input.Vote == nil {
+		response.BadRequest(c, "vote is required")
+		return
+	}
+	if err := h.service.VoteProposal(c.Request.Context(), c.Param("id"), userID, *input.Vote); err != nil {
 		response.BadRequest(c, err.Error())
 		return
 	}

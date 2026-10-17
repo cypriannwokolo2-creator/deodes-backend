@@ -21,7 +21,12 @@ var (
 	ErrMaxStrikes               = errors.New("maximum strikes reached")
 	ErrDuplicateFile            = errors.New("file with this name already exists")
 	ErrLateContributionRejected = errors.New("contributions rejected: payout scheduling has already begun for this round")
+	ErrDuplicateContribution    = errors.New("contribution for this round already recorded")
 	ErrCircleEnded              = errors.New("contributions rejected: circle has ended")
+	// ErrCircleSuspended marks an action on a paused or banned circle (admin
+	// moderation). Handlers map it to 422 like ErrCircleEnded, with a
+	// distinct code so clients can tell "paused" from "ended".
+	ErrCircleSuspended = errors.New("circle is paused or banned by moderation")
 	// ErrCircleContractMismatch marks a record attempt for a circle bound to
 	// a different on-chain contract than the configured circle (2.5).
 	// Handlers map it to 422 (wrong rail/circle).
@@ -29,8 +34,8 @@ var (
 	// ErrFeeMismatch marks a payout whose client-supplied fee differs from
 	// the server-computed 50bps split (2.8). The fee is protocol fixed, so
 	// a mismatch is a client bug, not a negotiation. Handlers map it to 422.
-	ErrFeeMismatch = errors.New("fee mismatch: payout fee must equal the protocol 50bps split")
-	ErrRequestEntityTooLarge  = errors.New("request body exceeds the maximum allowed size for this endpoint")
+	ErrFeeMismatch           = errors.New("fee mismatch: payout fee must equal the protocol 50bps split")
+	ErrRequestEntityTooLarge = errors.New("request body exceeds the maximum allowed size for this endpoint")
 	// ErrChainDisabled marks on-chain escrow operations attempted while no
 	// chain escrow client exists (purged rail). Handlers map it to 503.
 	ErrChainDisabled = errors.New("on-chain escrow unavailable")

@@ -3,11 +3,9 @@ definitions:
   circle.CircleCurrency:
     enum:
     - USDC
-    - XLM
     type: string
     x-enum-varnames:
     - CurrencyUSDC
-    - CurrencyXLM
   circle.CircleFrequency:
     enum:
     - daily
@@ -47,7 +45,6 @@ definitions:
         - $ref: '#/definitions/circle.CircleCurrency'
         enum:
         - USDC
-        - XLM
       description:
         type: string
       frequency:

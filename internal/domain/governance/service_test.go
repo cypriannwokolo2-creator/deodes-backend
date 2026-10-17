@@ -128,12 +128,12 @@ func TestProposalPagination(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	proposals, total, err := svc.ListProposals(ctx, 1, 10)
+	proposals, total, err := svc.ListProposals(ctx, 1, 10, "")
 	require.NoError(t, err)
 	assert.Equal(t, 15, total)
 	assert.Len(t, proposals, 10)
 
-	proposalsPage2, total, err := svc.ListProposals(ctx, 2, 10)
+	proposalsPage2, total, err := svc.ListProposals(ctx, 2, 10, "")
 	require.NoError(t, err)
 	assert.Equal(t, 15, total)
 	assert.Len(t, proposalsPage2, 5)

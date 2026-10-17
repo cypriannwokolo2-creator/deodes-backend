@@ -61,8 +61,30 @@ func mapLookupError(err error) error {
 	return fmt.Errorf("finding goal: %w", err)
 }
 
-func validateGoalName(name string) error {
-	trimmed := strings.TrimSpace(name)
+// ValidAutoFrequencies mirrors the goal-form schedule options.
+var ValidAutoFrequencies = map[string]bool{
+	"daily": true, "weekly": true, "biweekly": true, "monthly": true,
+}
+
+func normalizeAutoFrequency(freq string) string {
+	freq = strings.ToLower(strings.TrimSpace(freq))
+	if !ValidAutoFrequencies[freq] {
+		return "monthly"
+	}
+	return freq
+}
+
+func validateAutoSchedule(amount float64, freq string) error {
+	if math.IsNaN(amount) || math.IsInf(amount, 0) || amount < 0 {
+		return invalidInput("auto amount must not be negative")
+	}
+	if strings.TrimSpace(freq) != "" && !ValidAutoFrequencies[strings.ToLower(strings.TrimSpace(freq))] {
+		return invalidInput("auto frequency must be one of daily, weekly, biweekly, monthly")
+	}
+	return nil
+}
+
+func validateGoalName(name string) error {	trimmed := strings.TrimSpace(name)
 	if trimmed == "" {
 		return invalidInput("goal name is required")
 	}
@@ -128,6 +150,9 @@ func (s *service) CreateGoal(ctx context.Context, userID string, req CreateGoalR
 	if err := validateGoalDeadline(req.TargetDate); err != nil {
 		return nil, err
 	}
+	if err := validateAutoSchedule(req.AutoAmount, req.AutoFrequency); err != nil {
+		return nil, err
+	}
 	g := &SavingsGoal{
 		UserID:        userID,
 		Name:          strings.TrimSpace(req.Name),
@@ -137,6 +162,8 @@ func (s *service) CreateGoal(ctx context.Context, userID string, req CreateGoalR
 		TargetDate:    req.TargetDate,
 		CircleID:      req.CircleID,
 		AutoReserve:   req.AutoReserve,
+		AutoAmount:    req.AutoAmount,
+		AutoFrequency: normalizeAutoFrequency(req.AutoFrequency),
 		Status:        "active",
 	}
 	if err := s.repo.Create(ctx, g); err != nil {
@@ -212,6 +239,21 @@ func (s *service) UpdateGoal(ctx context.Context, userID, goalID string, req Upd
 	}
 	if req.AutoReserve != nil {
 		g.AutoReserve = *req.AutoReserve
+	}
+	if req.AutoAmount != nil || req.AutoFrequency != nil {
+		amount := g.AutoAmount
+		freq := g.AutoFrequency
+		if req.AutoAmount != nil {
+			amount = *req.AutoAmount
+		}
+		if req.AutoFrequency != nil {
+			freq = *req.AutoFrequency
+		}
+		if err := validateAutoSchedule(amount, freq); err != nil {
+			return nil, err
+		}
+		g.AutoAmount = amount
+		g.AutoFrequency = normalizeAutoFrequency(freq)
 	}
 	if req.Status != nil {
 		if !IsValidStatus(*req.Status) {

@@ -129,6 +129,8 @@ func TestCommunityHandler_Join(t *testing.T) {
 	svc := community.NewService(repo, nil)
 	cid, uid := uuid.New(), uuid.New()
 
+	repo.On("FindByID", mock.Anything, cid).Return(&community.Community{ID: cid}, nil)
+	repo.On("IsMember", mock.Anything, cid, uid).Return(false, nil)
 	repo.On("AddMember", mock.Anything, mock.AnythingOfType("*community.CommunityMember")).Return(nil)
 
 	h := handler.NewCommunityHandler(svc)

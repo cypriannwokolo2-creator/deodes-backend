@@ -18,10 +18,16 @@ type Service interface {
 	List(ctx context.Context, filter CommunityFilter) ([]Community, int, error)
 	Update(ctx context.Context, id, userID string, input UpdateCommunityInput) (*Community, error)
 	Delete(ctx context.Context, id, userID string) error
+	// SuspendCommunity freezes a community (admin moderation); UnsuspendCommunity
+	// clears it. AdminRemoveCommunity deletes without the owner check (ban).
+	SuspendCommunity(ctx context.Context, id, reason string) error
+	UnsuspendCommunity(ctx context.Context, id string) error
+	AdminRemoveCommunity(ctx context.Context, id string) error
 
 	Join(ctx context.Context, communityID, userID string) error
 	Leave(ctx context.Context, communityID, userID string) error
 	GetMembers(ctx context.Context, communityID string) ([]CommunityMember, error)
+	SearchMembers(ctx context.Context, communityID, search string) ([]CommunityMember, error)
 	IsMember(ctx context.Context, communityID, userID string) (bool, error)
 
 	CreateAnnouncement(ctx context.Context, communityID, userID, content string) (*Announcement, error)
@@ -155,6 +161,9 @@ func (s *communityService) Update(ctx context.Context, id, userID string, input 
 	if c.OwnerID != ownerID {
 		return nil, apperrors.ErrForbidden
 	}
+	if c.SuspendedAt != nil {
+		return nil, fmt.Errorf("community is suspended by moderation: %w", apperrors.ErrForbidden)
+	}
 
 	if input.Name != nil {
 		c.Name = *input.Name
@@ -196,6 +205,43 @@ func (s *communityService) Delete(ctx context.Context, id, userID string) error 
 	return s.repo.Delete(ctx, uid)
 }
 
+// SuspendCommunity freezes a community (admin moderation): hidden from
+// public listing, no joins/edits/new circles until unsuspended.
+func (s *communityService) SuspendCommunity(ctx context.Context, id, reason string) error {
+	uid, err := parseUUID(id)
+	if err != nil {
+		return err
+	}
+	if _, err := s.repo.FindByID(ctx, uid); err != nil {
+		return fmt.Errorf("finding community: %w", err)
+	}
+	return s.repo.Suspend(ctx, uid, reason)
+}
+
+// UnsuspendCommunity clears a moderation freeze.
+func (s *communityService) UnsuspendCommunity(ctx context.Context, id string) error {
+	uid, err := parseUUID(id)
+	if err != nil {
+		return err
+	}
+	if _, err := s.repo.FindByID(ctx, uid); err != nil {
+		return fmt.Errorf("finding community: %w", err)
+	}
+	return s.repo.Unsuspend(ctx, uid)
+}
+
+// AdminRemoveCommunity deletes a community without the owner check (ban).
+func (s *communityService) AdminRemoveCommunity(ctx context.Context, id string) error {
+	uid, err := parseUUID(id)
+	if err != nil {
+		return err
+	}
+	if _, err := s.repo.FindByID(ctx, uid); err != nil {
+		return fmt.Errorf("finding community: %w", err)
+	}
+	return s.repo.Delete(ctx, uid)
+}
+
 func (s *communityService) Join(ctx context.Context, communityID, userID string) error {
 	cid, err := parseUUID(communityID)
 	if err != nil {
@@ -211,6 +257,16 @@ func (s *communityService) Join(ctx context.Context, communityID, userID string)
 		UserID:      uid,
 		Role:        "member",
 		JoinedAt:    time.Now().UTC(),
+	}
+	if c, err := s.repo.FindByID(ctx, cid); err != nil {
+		return fmt.Errorf("finding community for join: %w", err)
+	} else if c.SuspendedAt != nil {
+		return fmt.Errorf("community is suspended by moderation: %w", apperrors.ErrForbidden)
+	}
+	if ok, err := s.repo.IsMember(ctx, cid, uid); err != nil {
+		return fmt.Errorf("checking community membership: %w", err)
+	} else if ok {
+		return apperrors.ErrConflict
 	}
 	if err := s.repo.AddMember(ctx, member); err != nil {
 		return err
@@ -250,6 +306,15 @@ func (s *communityService) GetMembers(ctx context.Context, communityID string) (
 		return nil, err
 	}
 	return s.repo.GetMembers(ctx, cid)
+}
+
+// SearchMembers filters community members by username/display name substring.
+func (s *communityService) SearchMembers(ctx context.Context, communityID, search string) ([]CommunityMember, error) {
+	cid, err := parseUUID(communityID)
+	if err != nil {
+		return nil, err
+	}
+	return s.repo.SearchMembers(ctx, cid, search)
 }
 
 func (s *communityService) IsMember(ctx context.Context, communityID, userID string) (bool, error) {

@@ -26,9 +26,16 @@ type Service interface {
 	Start(ctx context.Context, id, userID string) error
 	Close(ctx context.Context, id, userID string) error
 	Cancel(ctx context.Context, id, userID string) error
+	// PauseCircle halts an active circle (admin moderation). ResumeCircle
+	// returns a paused circle to active. BanCircle terminally shuts down a
+	// circle that is not completed or cancelled.
+	PauseCircle(ctx context.Context, id string) error
+	ResumeCircle(ctx context.Context, id string) error
+	BanCircle(ctx context.Context, id string) error
 	Join(ctx context.Context, circleID, userID string, inviteCode string) error
 	Exit(ctx context.Context, circleID, userID string) error
 	GetMembers(ctx context.Context, circleID string) ([]CircleMember, error)
+	SearchMembers(ctx context.Context, circleID, search string) ([]CircleMember, error)
 	IsMember(ctx context.Context, circleID, userID string) (bool, error)
 	RemoveMember(ctx context.Context, circleID, callerID, memberAddress string, reason string) error
 	ProcessMissedContributions(ctx context.Context, circleID string, roundNumber int) error
@@ -38,6 +45,8 @@ type Service interface {
 	QueryRoundConfig(ctx context.Context, circleID string, round int) (*RoundConfigSnapshot, error)
 	GetCircleSnapshot(ctx context.Context, circleID, userID string) (*CircleSnapshot, error)
 	GetBulkCircleSnapshots(ctx context.Context, userID string, circleIDs []string) ([]CircleSnapshot, error)
+	// GetUserCircles lists circles the user actively belongs to (admin detail).
+	GetUserCircles(ctx context.Context, userID string) ([]Circle, error)
 }
 
 type UserMOIFetcher interface {
@@ -396,6 +405,13 @@ type NotificationSender interface {
 	Create(ctx context.Context, input notification.CreateInput) (*notification.Notification, error)
 }
 
+// BalanceChecker reports a user's spendable USDC balance. It is a narrow
+// float64 interface (not wallet.Service) so the circle domain never imports
+// the wallet domain — main wires the real implementation (keeper precedent).
+type BalanceChecker interface {
+	GetBalance(ctx context.Context, userID string) (float64, error)
+}
+
 // Dependencies holds the optional collaborators injected into the circle
 // service. All fields are optional; nil values are safely handled at call sites.
 type Dependencies struct {
@@ -404,6 +420,9 @@ type Dependencies struct {
 	Transactor       Transactor
 	AuditLogger      AuditLogger
 	NotificationSvc  NotificationSender
+	// BalanceChecker gates circle creation and joining on funded wallets.
+	// Nil disables the gate (dev/test).
+	BalanceChecker BalanceChecker
 }
 
 type circleService struct {
@@ -414,6 +433,7 @@ type circleService struct {
 	tx               Transactor
 	auditRepo        AuditLogger
 	notificationSvc  NotificationSender
+	balanceChecker   BalanceChecker
 }
 
 func NewService(repo Repository, userRepo UserMOIFetcher, deps Dependencies) Service {
@@ -425,7 +445,26 @@ func NewService(repo Repository, userRepo UserMOIFetcher, deps Dependencies) Ser
 		tx:               deps.Transactor,
 		auditRepo:        deps.AuditLogger,
 		notificationSvc:  deps.NotificationSvc,
+		balanceChecker:   deps.BalanceChecker,
 	}
+}
+
+// requireFunds enforces the funded-wallet gate: balance must cover amount.
+// A nil checker disables the gate. Unreadable balances fail closed —
+// waving through an unchecked wallet would reintroduce junk circles.
+func (s *circleService) requireFunds(ctx context.Context, userID string, amount float64) error {
+	if s.balanceChecker == nil {
+		return nil
+	}
+	bal, err := s.balanceChecker.GetBalance(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("verifying wallet balance: %w", err)
+	}
+	if bal < amount {
+		return fmt.Errorf("wallet balance %.2f USDC is below the %.2f USDC first contribution: %w",
+			bal, amount, ErrInsufficientFunds)
+	}
+	return nil
 }
 
 type circleTransactor struct {
@@ -622,6 +661,12 @@ func (s *circleService) Create(ctx context.Context, organizerID string, input Cr
 		}
 	}
 
+	// Funds gate (T019): creating a circle with an empty wallet spawns junk
+	// circles. The organizer must cover at least the first contribution.
+	if err := s.requireFunds(ctx, organizerID, input.ContributionAmount); err != nil {
+		return nil, err
+	}
+
 	now := time.Now().UTC()
 	startTime, hasStart, _ := parseCircleStartDate(input.StartDate)
 
@@ -717,6 +762,23 @@ func (s *circleService) Start(ctx context.Context, id, userID string) error {
 		return fmt.Errorf("need at least 2 members to start")
 	}
 
+	// Start gate: every member must still cover the first contribution —
+	// balances move between join and start.
+	if s.balanceChecker != nil {
+		members, err := s.repo.GetMembers(ctx, cid)
+		if err != nil {
+			return fmt.Errorf("checking members for start: %w", err)
+		}
+		for i := range members {
+			if members[i].Status != MemberStatusActive {
+				continue
+			}
+			if err := s.requireFunds(ctx, members[i].UserID.String(), c.ContributionAmount); err != nil {
+				return err
+			}
+		}
+	}
+
 	c.Status = CircleStatusActive
 	c.CurrentRound = 1
 	c.UpdatedAt = time.Now().UTC()
@@ -763,6 +825,83 @@ func (s *circleService) Cancel(ctx context.Context, id, userID string) error {
 		s.broadcaster.CircleStatusChanged(ctx, id, "cancelled")
 	}
 	return err
+}
+
+// PauseCircle halts an active circle (admin moderation): joins,
+// contributions, payouts and keeper debits all fail closed on the paused
+// status until resumed. Only active circles can be paused.
+func (s *circleService) PauseCircle(ctx context.Context, id string) error {
+	cid, err := parseUUID(id)
+	if err != nil {
+		return err
+	}
+	c, err := s.repo.FindByID(ctx, cid)
+	if err != nil {
+		return fmt.Errorf("finding circle for pause: %w", err)
+	}
+	if c.Status != CircleStatusActive {
+		return fmt.Errorf("only active circles can be paused: %w", ErrCircleNotActive)
+	}
+	c.Status = CircleStatusPaused
+	c.UpdatedAt = time.Now().UTC()
+	if err := s.repo.Update(ctx, c); err != nil {
+		return fmt.Errorf("pausing circle: %w", err)
+	}
+	if s.broadcaster != nil {
+		s.broadcaster.CircleStatusChanged(ctx, id, string(CircleStatusPaused))
+	}
+	return nil
+}
+
+// ResumeCircle returns a paused circle to active (admin moderation).
+func (s *circleService) ResumeCircle(ctx context.Context, id string) error {
+	cid, err := parseUUID(id)
+	if err != nil {
+		return err
+	}
+	c, err := s.repo.FindByID(ctx, cid)
+	if err != nil {
+		return fmt.Errorf("finding circle for resume: %w", err)
+	}
+	if c.Status != CircleStatusPaused {
+		return fmt.Errorf("only paused circles can be resumed: %w", ErrCircleNotActive)
+	}
+	c.Status = CircleStatusActive
+	c.UpdatedAt = time.Now().UTC()
+	if err := s.repo.Update(ctx, c); err != nil {
+		return fmt.Errorf("resuming circle: %w", err)
+	}
+	if s.broadcaster != nil {
+		s.broadcaster.CircleStatusChanged(ctx, id, string(CircleStatusActive))
+	}
+	return nil
+}
+
+// BanCircle terminally shuts down a circle (admin moderation): pending,
+// active and paused circles can be banned; completed and cancelled ones are
+// already terminal. Irreversible by design.
+func (s *circleService) BanCircle(ctx context.Context, id string) error {
+	cid, err := parseUUID(id)
+	if err != nil {
+		return err
+	}
+	c, err := s.repo.FindByID(ctx, cid)
+	if err != nil {
+		return fmt.Errorf("finding circle for ban: %w", err)
+	}
+	switch c.Status {
+	case CircleStatusCompleted, CircleStatusCancelled, CircleStatusBanned:
+		return fmt.Errorf("circle is already terminal (%s): %w", c.Status, ErrCircleNotActive)
+	}
+	c.Status = CircleStatusBanned
+	c.UpdatedAt = time.Now().UTC()
+	if err := s.repo.Update(ctx, c); err != nil {
+		return fmt.Errorf("banning circle: %w", err)
+	}
+	if s.broadcaster != nil {
+		s.broadcaster.CircleStatusChanged(ctx, id, string(CircleStatusBanned))
+	}
+	return nil
 }
 
 // Close completes an active circle after its final payout. Only the organizer
@@ -871,6 +1010,12 @@ func (s *circleService) Join(ctx context.Context, circleID, userID string, invit
 
 	if (c.CircleType == CircleTypePrivate || c.RequiresInvite) && inviteCode == "" {
 		return ErrInvalidInvite
+	}
+
+	// Funds gate: members must cover the first contribution, or they join
+	// as dead weight the circle can never collect from.
+	if err := s.requireFunds(ctx, userID, c.ContributionAmount); err != nil {
+		return err
 	}
 
 	err = s.withTransaction(ctx, func(repo Repository) error {
@@ -995,6 +1140,33 @@ func (s *circleService) GetMembers(ctx context.Context, circleID string) ([]Circ
 		return nil, fmt.Errorf("getting members: %w", err)
 	}
 	return members, nil
+}
+
+// SearchMembers filters circle members by username/display name substring.
+func (s *circleService) SearchMembers(ctx context.Context, circleID, search string) ([]CircleMember, error) {
+	cid, err := parseUUID(circleID)
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err = s.repo.FindByID(ctx, cid); err != nil {
+		return nil, fmt.Errorf("finding circle for members: %w", err)
+	}
+
+	members, err := s.repo.SearchMembers(ctx, cid, search)
+	if err != nil {
+		return nil, fmt.Errorf("searching members: %w", err)
+	}
+	return members, nil
+}
+
+// GetUserCircles lists circles the user actively belongs to (admin detail).
+func (s *circleService) GetUserCircles(ctx context.Context, userID string) ([]Circle, error) {
+	uid, err := parseUUID(userID)
+	if err != nil {
+		return nil, err
+	}
+	return s.repo.FindCirclesByUserID(ctx, uid)
 }
 
 // IsMember reports whether the user is an active member of the circle.
@@ -1253,6 +1425,31 @@ func (s *circleService) SubmitAuctionBid(ctx context.Context, circleID, userID s
 	roundNum := c.CurrentRound
 	if roundNum < 1 {
 		roundNum = 1
+	}
+
+	// Bid discipline (T025): one live bid per member per round, each new bid
+	// strictly above the round's current high. Spam and penny-increment
+	// flooding die here instead of in the payout math.
+	existing, err := s.repo.GetAuctionBidsByRound(ctx, cid, roundNum)
+	if err != nil {
+		return nil, fmt.Errorf("checking existing bids: %w", err)
+	}
+	high := 0.0
+	for i := range existing {
+		if existing[i].BidderID == bidderID {
+			return nil, fmt.Errorf("you already have a bid in this round: %w", apperrors.ErrConflict)
+		}
+		if existing[i].BidAmount > high {
+			high = existing[i].BidAmount
+		}
+	}
+	if len(existing) > 0 && input.BidAmount <= high {
+		return nil, fmt.Errorf("bid must beat the current high of %.2f: %w", high, apperrors.ErrInvalidInput)
+	}
+
+	// Funded bidder: a bid is a promise to pay the bid amount.
+	if err := s.requireFunds(ctx, userID, input.BidAmount); err != nil {
+		return nil, err
 	}
 
 	bid := &CircleAuctionBid{

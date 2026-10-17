@@ -217,11 +217,22 @@ func (m *mockWalletService) DeleteWallet(ctx context.Context, userID, walletID s
 	return m.Called(ctx, userID, walletID).Error(0)
 }
 
+func (m *mockWalletService) CheckTransferSettlement(ctx context.Context, txHash string) (bool, bool) {
+	args := m.Called(ctx, txHash)
+	return args.Bool(0), args.Bool(1)
+}
+
+func (m *mockWalletService) DailyAllowance(ctx context.Context, userID string) (float64, float64, float64, error) {
+	args := m.Called(ctx, userID)
+	return args.Get(0).(float64), args.Get(1).(float64), args.Get(2).(float64), args.Error(3)
+}
+
 func TestAuthHandler_Register_Success(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	env := newRegisterEnv(t)
 
 	env.mockUserRepo.On("FindByWalletAddress", mock.Anything, emailWalletAddr(testEmail)).Return(nil, apperrors.ErrNotFound)
+	env.mockUserRepo.On("FindByEmail", mock.Anything, testEmail).Return(nil, apperrors.ErrNotFound)
 
 	r := gin.New()
 	r.POST("/v1/auth/register", env.handler.Register)
@@ -248,6 +259,7 @@ func TestAuthHandler_Register_DoesNotExposeWalletSeed(t *testing.T) {
 	env := newRegisterEnv(t)
 
 	env.mockUserRepo.On("FindByWalletAddress", mock.Anything, emailWalletAddr("sec-test@example.com")).Return(nil, apperrors.ErrNotFound)
+	env.mockUserRepo.On("FindByEmail", mock.Anything, "sec-test@example.com").Return(nil, apperrors.ErrNotFound)
 
 	r := gin.New()
 	r.POST("/v1/auth/register", env.handler.Register)
@@ -309,7 +321,46 @@ func TestAuthHandler_Register_ExistingUser(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	r.ServeHTTP(w, req)
 
-	assert.Equal(t, 409, w.Code)
+	// Anti-enumeration: same success as a fresh registration, no 409 oracle.
+	assert.Equal(t, 200, w.Code)
+	assert.Contains(t, w.Body.String(), "verification code sent")
+	assert.Empty(t, env.sentOTP, "no code may be sent for an existing account")
+	env.mockUserRepo.AssertExpectations(t)
+}
+
+// Google sign-in accounts store a real wallet address, not the EMAIL:
+// pseudo-wallet, so the wallet-key leg alone missed them — the OTP was
+// actually emailed before RegisterVerify hit the unique-email conflict.
+// The email leg must catch them with the same no-send response.
+func TestAuthHandler_Register_ExistingByEmail_NoOTP(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	env := newRegisterEnv(t)
+
+	googleUser := &user.User{
+		ID:            uuid.New(),
+		WalletAddress: "0x1111111111111111111111111111111111111111",
+		Role:          user.RoleUser,
+	}
+	env.mockUserRepo.On("FindByWalletAddress", mock.Anything, emailWalletAddr(testEmail)).Return(nil, apperrors.ErrNotFound)
+	env.mockUserRepo.On("FindByEmail", mock.Anything, testEmail).Return(googleUser, nil)
+
+	r := gin.New()
+	r.POST("/v1/auth/register", env.handler.Register)
+
+	body, _ := json.Marshal(map[string]string{
+		"email":    testEmail,
+		"password": "SuperSecret123!",
+	})
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/auth/register", bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	// Same response as every other existing-account hit: fake success,
+	// but nothing is stored and no code leaves the mailer.
+	assert.Equal(t, 200, w.Code)
+	assert.Contains(t, w.Body.String(), "verification code sent")
+	assert.Empty(t, env.sentOTP, "no code may be sent to an existing account")
 	env.mockUserRepo.AssertExpectations(t)
 }
 
@@ -318,6 +369,7 @@ func TestAuthHandler_RegisterVerify_Success(t *testing.T) {
 	env := newRegisterEnv(t)
 
 	env.mockUserRepo.On("FindByWalletAddress", mock.Anything, emailWalletAddr(testEmail)).Return(nil, apperrors.ErrNotFound)
+	env.mockUserRepo.On("FindByEmail", mock.Anything, testEmail).Return(nil, apperrors.ErrNotFound)
 
 	r := gin.New()
 	r.POST("/v1/auth/register", env.handler.Register)
@@ -335,7 +387,9 @@ func TestAuthHandler_RegisterVerify_Success(t *testing.T) {
 	assert.Len(t, env.sentOTP, 6)
 
 	env.mockUserRepo.On("Create", mock.Anything, mock.AnythingOfType("*user.User")).Return(nil)
+	env.mockUserRepo.On("FindByUsername", mock.Anything, mock.AnythingOfType("string")).Return(nil, apperrors.ErrNotFound)
 	env.mockUserRepo.On("FindByWalletAddress", mock.Anything, emailWalletAddr(testEmail)).Return(nil, apperrors.ErrNotFound)
+	env.mockUserRepo.On("FindByEmail", mock.Anything, testEmail).Return(nil, apperrors.ErrNotFound)
 	env.mockAuthSvc.On("CreateSession", mock.Anything, mock.AnythingOfType("uuid.UUID"), mock.Anything, mock.Anything, mock.Anything).Return(
 		&auth.TokenPair{AccessToken: "jwt-token", RefreshToken: "refresh-token", CSRFToken: "csrf-token"}, nil,
 	)
@@ -357,11 +411,63 @@ func TestAuthHandler_RegisterVerify_Success(t *testing.T) {
 	env.mockUserRepo.AssertExpectations(t)
 }
 
+func TestAuthHandler_Register_MixedCaseEmailEndToEnd(t *testing.T) {
+	// Mailbox delivery is case-insensitive but Redis OTP keys, wallet
+	// derivation, and HashEmail are not: register UPPER, verify lower must
+	// still meet on the same keys (regression: correct codes 400'd on any
+	// case variance between the calls).
+	gin.SetMode(gin.TestMode)
+	env := newRegisterEnv(t)
+
+	env.mockUserRepo.On("FindByWalletAddress", mock.Anything, emailWalletAddr("user@example.com")).Return(nil, apperrors.ErrNotFound)
+	env.mockUserRepo.On("FindByEmail", mock.Anything, "user@example.com").Return(nil, apperrors.ErrNotFound)
+
+	r := gin.New()
+	r.POST("/v1/auth/register", env.handler.Register)
+	r.POST("/v1/auth/register/verify", env.handler.RegisterVerify)
+
+	body, _ := json.Marshal(map[string]string{
+		"email":    "User@Example.COM",
+		"password": "SuperSecret123!",
+	})
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/auth/register", bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+	assert.Equal(t, 201, w.Code)
+	assert.Len(t, env.sentOTP, 6)
+
+	env.mockUserRepo.On("Create", mock.Anything, mock.AnythingOfType("*user.User")).Return(nil)
+	env.mockUserRepo.On("FindByUsername", mock.Anything, mock.AnythingOfType("string")).Return(nil, apperrors.ErrNotFound)
+	env.mockUserRepo.On("FindByWalletAddress", mock.Anything, emailWalletAddr("user@example.com")).Return(nil, apperrors.ErrNotFound)
+	env.mockUserRepo.On("FindByEmail", mock.Anything, "user@example.com").Return(nil, apperrors.ErrNotFound)
+	env.mockAuthSvc.On("CreateSession", mock.Anything, mock.AnythingOfType("uuid.UUID"), mock.Anything, mock.Anything, mock.Anything).Return(
+		&auth.TokenPair{AccessToken: "jwt-token", RefreshToken: "refresh-token", CSRFToken: "csrf-token"}, nil,
+	)
+	env.walletMock().On("CreateWallet", mock.Anything, mock.AnythingOfType("string"), mock.AnythingOfType("[]uint8")).Return(nil, nil)
+	env.walletMock().On("CreateHostedArcWallet", mock.Anything, mock.AnythingOfType("string"), mock.AnythingOfType("[]uint8")).Return(&wallet.Wallet{PublicKey: "0x0000000000000000000000000000000000000001"}, nil)
+
+	verifyBody, _ := json.Marshal(map[string]string{
+		"email": "USER@example.com",
+		"code":  env.sentOTP,
+	})
+	w2 := httptest.NewRecorder()
+	req2, _ := http.NewRequest("POST", "/v1/auth/register/verify", bytes.NewBuffer(verifyBody))
+	req2.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w2, req2)
+
+	assert.Equal(t, 201, w2.Code)
+	assert.Contains(t, w2.Body.String(), "jwt-token")
+	env.mockAuthSvc.AssertExpectations(t)
+	env.mockUserRepo.AssertExpectations(t)
+}
+
 func TestAuthHandler_RegisterVerify_BadCode(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	env := newRegisterEnv(t)
 
 	env.mockUserRepo.On("FindByWalletAddress", mock.Anything, emailWalletAddr(testEmail)).Return(nil, apperrors.ErrNotFound)
+	env.mockUserRepo.On("FindByEmail", mock.Anything, testEmail).Return(nil, apperrors.ErrNotFound)
 
 	r := gin.New()
 	r.POST("/v1/auth/register", env.handler.Register)

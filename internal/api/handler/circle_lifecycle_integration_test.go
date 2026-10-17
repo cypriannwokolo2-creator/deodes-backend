@@ -45,7 +45,10 @@ func (s *lifecycleStore) reset() {
 	s.payouts = nil
 }
 
-type lifecycleCircleService struct{ store *lifecycleStore }
+type lifecycleCircleService struct {
+	circle.Service
+	store *lifecycleStore
+}
 
 func (s *lifecycleCircleService) QueryRoundConfig(_ context.Context, _ string, _ int) (*circle.RoundConfigSnapshot, error) {
 	return nil, circle.ErrCircleNotFound
@@ -134,6 +137,12 @@ func (s *lifecycleCircleService) Exit(context.Context, string, string) error { r
 
 func (s *lifecycleCircleService) GetMembers(
 	context.Context, string,
+) ([]circle.CircleMember, error) {
+	return []circle.CircleMember{}, nil
+}
+
+func (s *lifecycleCircleService) SearchMembers(
+	_ context.Context, _ string, _ string,
 ) ([]circle.CircleMember, error) {
 	return []circle.CircleMember{}, nil
 }

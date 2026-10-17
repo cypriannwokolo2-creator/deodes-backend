@@ -77,6 +77,17 @@ func SplitOrigins(raw string) []string {
 	return out
 }
 
+// DefaultCORSAllowedHeaders is the canonical CORS allow-list used when the
+// operator has not configured cors.allowed_headers. It must stay in sync with
+// the headers money-moving clients actually send: every route behind
+// middleware.RequireIdempotencyKey rejects requests without an Idempotency-Key
+// (or X-Idempotency-Key) header, so omitting them here makes the browser
+// preflight fail and the real request is never dispatched (axios surfaces this
+// as a bare "Network Error" with only an OPTIONS hit in the edge logs).
+func DefaultCORSAllowedHeaders() []string {
+	return []string{"Authorization", "Content-Type", "X-Request-ID", "Idempotency-Key", "X-Idempotency-Key"}
+}
+
 func originsFromEnv() []string {
 	for _, name := range corsOriginsEnvVars {
 		raw, ok := os.LookupEnv(name)

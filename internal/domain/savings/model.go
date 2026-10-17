@@ -39,6 +39,11 @@ type SavingsGoal struct {
 	TargetDate    *string   `json:"targetDate,omitempty" db:"target_date"`
 	CircleID      *string   `json:"circleId,omitempty" db:"circle_id"`
 	AutoReserve   bool      `json:"autoReserve" db:"auto_reserve"`
+	// Auto-save schedule: fixed amount per frequency, topped up by the
+	// keeper while the goal is active. LastAutoAt tracks the last run.
+	AutoAmount    float64    `json:"autoAmount" db:"auto_amount"`
+	AutoFrequency string     `json:"autoFrequency" db:"auto_frequency"`
+	LastAutoAt    *time.Time `json:"lastAutoAt,omitempty" db:"last_auto_at"`
 	Status        string    `json:"status" db:"status"`
 	CreatedAt     time.Time `json:"createdAt" db:"created_at"`
 	UpdatedAt     time.Time `json:"updatedAt" db:"updated_at"`
@@ -51,6 +56,8 @@ type CreateGoalRequest struct {
 	TargetDate   *string `json:"targetDate"`
 	CircleID     *string `json:"circleId"`
 	AutoReserve  bool    `json:"autoReserve"`
+	AutoAmount   float64 `json:"autoAmount"`
+	AutoFrequency string `json:"autoFrequency"`
 }
 
 type UpdateGoalRequest struct {
@@ -60,6 +67,8 @@ type UpdateGoalRequest struct {
 	CurrentAmount *float64 `json:"currentAmount"`
 	TargetDate    *string  `json:"targetDate"`
 	CircleID      *string  `json:"circleId"`
+	AutoAmount    *float64 `json:"autoAmount"`
+	AutoFrequency *string  `json:"autoFrequency"`
 	AutoReserve   *bool    `json:"autoReserve"`
 	Status        *string  `json:"status"`
 }

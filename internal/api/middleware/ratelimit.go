@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin/binding"
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog/log"
 
@@ -108,6 +110,7 @@ func enforceRateLimit(c *gin.Context, redisClient *redis.Client, key string, lim
 		if failClosed {
 			log.Error().Err(err).Str("key", key).Msg("rate limit check failed: Redis unavailable, failing closed")
 			setRateLimitHeaders(c, limit, 0, window)
+			c.Header("Retry-After", strconv.FormatInt(int64(window.Seconds()), 10))
 			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
 				"success":    false,
 				"error":      "service temporarily unavailable",
@@ -123,10 +126,15 @@ func enforceRateLimit(c *gin.Context, redisClient *redis.Client, key string, lim
 	setRateLimitHeaders(c, limit, remaining, ttl)
 
 	if !allowed {
+		retrySecs := int64(ttl.Seconds())
+		if retrySecs < 1 {
+			retrySecs = 1
+		}
+		c.Header("Retry-After", strconv.FormatInt(retrySecs, 10))
 		c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
 			"success":    false,
 			"error":      errorMessage,
-			"retryAfter": int64(ttl.Seconds()),
+			"retryAfter": retrySecs,
 		})
 		return false
 	}
@@ -180,6 +188,28 @@ func PerResourceRateLimitMiddleware(redisClient *redis.Client, resource string, 
 	}
 }
 
+// PerResourceRateLimitMiddlewareLive is the hot-reloadable variant: limits are
+// resolved on every request via resolve, so operator edits to otp/login
+// buckets apply without a restart. Falls back to static limit/window when
+// resolve is nil.
+func PerResourceRateLimitMiddlewareLive(redisClient *redis.Client, resource string, limit int, window time.Duration, resolve func() (int, time.Duration), opts ...RateLimitOption) gin.HandlerFunc {
+	failClosed := resolveFailClosed(config.RateLimitConfig{}, opts...)
+	return func(c *gin.Context) {
+		l, w := limit, window
+		if resolve != nil {
+			if rl, rw := resolve(); rl > 0 && rw > 0 {
+				l, w = rl, rw
+			}
+		}
+		key := fmt.Sprintf("ratelimit:r:%s:%s", resource, c.ClientIP())
+
+		if !enforceRateLimit(c, redisClient, key, l, w, failClosed, fmt.Sprintf("rate limit exceeded for %s", resource)) {
+			return
+		}
+		c.Next()
+	}
+}
+
 // PasswordResetRateLimitMiddleware enforces dual-dimension rate limiting (per-IP and per-account) on password reset.
 func PasswordResetRateLimitMiddleware(redisClient *redis.Client, ipLimit, accountLimit, windowSeconds int) gin.HandlerFunc {
 	window := time.Duration(windowSeconds) * time.Second
@@ -203,6 +233,18 @@ func PasswordResetRateLimitMiddleware(redisClient *redis.Client, ipLimit, accoun
 		account := c.Query("email")
 		if account == "" {
 			account = c.Query("account")
+		}
+		if account == "" {
+			// Forgot/reset carry the email in the JSON body, not the
+			// query string — without this the per-account dimension
+			// never fires. ShouldBindBodyWith caches the body so the
+			// handler can bind it again.
+			var body struct {
+				Email string `json:"email"`
+			}
+			if err := c.ShouldBindBodyWith(&body, binding.JSON); err == nil {
+				account = strings.ToLower(strings.TrimSpace(body.Email))
+			}
 		}
 		if account != "" {
 			accountKey := fmt.Sprintf("pwreset:account:%s", account)

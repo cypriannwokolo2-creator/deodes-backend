@@ -89,6 +89,14 @@ func (m *mockMMWalletService) DeleteWallet(ctx context.Context, userID, walletID
 	return nil
 }
 
+func (m *mockMMWalletService) DailyAllowance(ctx context.Context, userID string) (float64, float64, float64, error) {
+	return 0, 1000, 1000, nil
+}
+
+func (m *mockMMWalletService) CheckTransferSettlement(ctx context.Context, txHash string) (bool, bool) {
+	return false, false
+}
+
 func TestMobileMoneyHandler_InitiateOnramp_RequiresIdempotencyKey(t *testing.T) {
 	mockWallet := &mockMMWalletService{wallets: []wallet.Wallet{{PublicKey: "GABC"}}}
 	svc := &fakeMMService{}

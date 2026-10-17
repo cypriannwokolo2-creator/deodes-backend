@@ -148,7 +148,7 @@ func TestContribute_RejectsWrongAmount(t *testing.T) {
 
 func TestContribute_RejectsNonUSDC(t *testing.T) {
 	cir := testContributeCircle(100)
-	cir.Currency = circle.CurrencyXLM
+	cir.Currency = circle.CircleCurrency("XLM")
 	r := newContributeRouter(&contributeCircleStub{cir: cir}, &contributeSvcStub{})
 	code, _ := doContribute(t, r, cir.ID.String(), uuid.New().String(), map[string]any{
 		"amount": 100, "txnHash": validArcHash, "roundNumber": 1,

@@ -37,8 +37,8 @@ const (
 type CircleCurrency string
 
 const (
+	// CurrencyUSDC is the only supported circle currency: USDC on Arc EVM.
 	CurrencyUSDC CircleCurrency = "USDC"
-	CurrencyXLM  CircleCurrency = "XLM"
 )
 
 type CircleStatus string
@@ -48,6 +48,13 @@ const (
 	CircleStatusActive    CircleStatus = "active"
 	CircleStatusCompleted CircleStatus = "completed"
 	CircleStatusCancelled CircleStatus = "cancelled"
+	// CircleStatusPaused halts all activity (joins, contributions, payouts,
+	// keeper debits) until resumed. Only set by admin moderation; gates
+	// whitelist pending/active so paused fails closed automatically.
+	CircleStatusPaused CircleStatus = "paused"
+	// CircleStatusBanned terminally shuts a circle down. Only set by admin
+	// moderation; irreversible by design (create a new circle instead).
+	CircleStatusBanned CircleStatus = "banned"
 )
 
 type MemberStatus string
@@ -96,10 +103,12 @@ type CircleMember struct {
 	UserID   uuid.UUID    `json:"userId" db:"user_id"`
 	Position int          `json:"position" db:"position"`
 	Status   MemberStatus `json:"status" db:"status"`
-	// Strikes accumulates late/missed-contribution penalties (2.7); at
-	// MaxStrikes the member is removed. Persisted in circle_members.strikes.
-	Strikes  int       `json:"strikes" db:"strikes"`
-	JoinedAt time.Time `json:"joinedAt" db:"joined_at"`
+	// Username/DisplayName are joined from users for display (T007) — never
+	// written through this struct.
+	Username    *string   `json:"username,omitempty" db:"-"`
+	DisplayName *string   `json:"displayName,omitempty" db:"-"`
+	Strikes     int       `json:"strikes" db:"strikes"`
+	JoinedAt    time.Time `json:"joinedAt" db:"joined_at"`
 }
 
 type PenaltyType string

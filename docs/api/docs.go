@@ -2267,12 +2267,10 @@ const docTemplate = `{
         "circle.CircleCurrency": {
             "type": "string",
             "enum": [
-                "USDC",
-                "XLM"
+                "USDC"
             ],
             "x-enum-varnames": [
-                "CurrencyUSDC",
-                "CurrencyXLM"
+                "CurrencyUSDC"
             ]
         },
         "circle.CircleFrequency": {
@@ -2334,8 +2332,7 @@ const docTemplate = `{
                 },
                 "currency": {
                     "enum": [
-                        "USDC",
-                        "XLM"
+                        "USDC"
                     ],
                     "allOf": [
                         {

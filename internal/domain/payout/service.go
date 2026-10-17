@@ -62,13 +62,13 @@ type ServiceWithCircle interface {
 	// Empty clears it (chain checks dormant). A malformed address is
 	// rejected here so a typo fails wiring, not a live payout.
 	SetArcCircleAddress(addr string) error
-	// SetTxVerifier wires record-time on-chain verification (2.8, parked).
+	// SetTxVerifier wires record-time on-chain verification (2.1).
 	// Nil clears it (pending semantics, indexer settles later).
 	SetTxVerifier(v TxVerifier)
 }
 
 // TxVerifier is the minimal Arc receipt surface for record-time on-chain
-// verification (2.8). *arc.Client satisfies it; tests stub it.
+// verification (2.1). *arc.Client satisfies it; tests stub it.
 type TxVerifier interface {
 	GetTransactionReceipt(ctx context.Context, txHash string) (*arc.Receipt, error)
 }
@@ -96,8 +96,8 @@ type service struct {
 }
 
 // NewService constructs the payout service. On-chain verification is the Arc
-// indexer's job (2.6): hashes record as pending unless the caller supplies
-// an explicit verification state.
+// indexer's job (2.6) unless a TxVerifier is wired via SetTxVerifier (2.1):
+// hashes then verify at record time, and only RPC flakes stay pending.
 //
 //	walletLookup – may be nil (recipient wallet check skipped)
 //	circleSvc    – circle service for membership/round validity checks
@@ -120,6 +120,48 @@ func NewService(repo Repository, walletLookup interface{}, circleSvc circle.Serv
 		walletLookup:  wl,
 		circleService: circleSvc,
 	}
+}
+
+// verifyTxAtRecord consults the wired TxVerifier (nil = dormant). Confirmed
+// receipts settle immediately; reverted or wrong-contract receipts fail;
+// RPC errors and unmined hashes stay unknown for the indexer. The lookup
+// runs under a short timeout so a slow node degrades to pending, never to
+// a hung request.
+//
+// Coverage gate: a receipt confirms only when its logs contain an ERC-20
+// Transfer from the executed contract covering the claimed amount. A small
+// real transfer recorded with a large claimed amount stays pending instead
+// of verifying — the indexer settles truth. Receipts without logs stay
+// unknown: under-confirming is safe, over-confirming a forged claim is not.
+func (s *service) verifyTxAtRecord(ctx context.Context, txnHash, contractAddr string, claimedAmount float64) (verifyOutcome, string) {
+	if s.verifier == nil || txnHash == "" {
+		return verifyUnknown, ""
+	}
+	vctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	receipt, err := s.verifier.GetTransactionReceipt(vctx, txnHash)
+	if err != nil {
+		log.Warn().Err(err).Str("txn_hash", txnHash).Msg("record-time receipt lookup failed; leaving pending for indexer")
+		return verifyUnknown, ""
+	}
+	if receipt == nil || !receipt.Found {
+		return verifyUnknown, ""
+	}
+	if receipt.Status != 1 {
+		return verifyFailed, fmt.Sprintf("transaction %s reverted on-chain (status %d)", txnHash, receipt.Status)
+	}
+	if contractAddr != "" && !strings.EqualFold(strings.TrimSpace(receipt.To), contractAddr) {
+		return verifyFailed, fmt.Sprintf("transaction %s executed against %s, not the circle contract %s", txnHash, receipt.To, contractAddr)
+	}
+	if required := arc.USDCFloatToBaseUnits(claimedAmount); required.Sign() > 0 {
+		if receipt.Logs == nil {
+			return verifyUnknown, ""
+		}
+		if max := arc.MaxTransferValue(receipt.Logs, receipt.To); max == nil || max.Cmp(required) < 0 {
+			return verifyUnknown, ""
+		}
+	}
+	return verifyConfirmed, ""
 }
 
 // Record verifies the on-chain transaction and persists the payout.
@@ -151,19 +193,12 @@ func (s *service) Record(ctx context.Context, input RecordInput) (*Payout, error
 		return nil, fmt.Errorf("invalid fee amount %v: exceeds payout amount %v", input.FeeAmount, input.Amount)
 	}
 
-	// Idempotency: return existing record if this txnHash was already processed.
-	if input.TxnHash != "" {
-		existing, err := s.repo.FindByTxnHash(ctx, input.TxnHash)
-		if err == nil && existing != nil {
-			log.Info().Str("txn_hash", input.TxnHash).Msg("payout already recorded (idempotent replay)")
-			return existing, nil
-		}
-	}
-
-	// Validate membership and round validity. A nil circle service (unit
-	// tests, indexer replay) skips the membership check and only requires a
-	// positive round number.
+	// Validate membership FIRST: a hash replayed by a non-member (or into a
+	// circle they don't belong to) must be rejected before any row is
+	// returned. A nil circle service (unit tests, indexer replay) skips the
+	// membership check and only requires a positive round number.
 	isOnTime := input.RoundNumber >= 1
+	contractAddr := ""
 	if s.circleService != nil {
 		member, err := s.circleService.IsMember(ctx, input.CircleID, input.RecipientID)
 		if err != nil {
@@ -180,12 +215,44 @@ func (s *service) Record(ctx context.Context, input RecordInput) (*Payout, error
 
 		// Phase 2.5: the payout must resolve against the configured
 		// circle contract — a circle bound elsewhere is the wrong rail.
-		if _, err := s.resolveCircleContract(cir); err != nil {
+		addr, err := s.resolveCircleContract(cir)
+		if err != nil {
 			return nil, err
+		}
+		contractAddr = addr
+
+		// Moderated circles record nothing: paused/banned fail closed here
+		// like completed/cancelled do for contributions.
+		if cir.Status == circle.CircleStatusPaused || cir.Status == circle.CircleStatusBanned {
+			return nil, apperrors.ErrCircleSuspended
+		}
+
+		// Pool sanity (T029): a single payout can never exceed the
+		// theoretical maximum pool (contribution × max members). Absurd
+		// amounts fail here instead of hitting the chain.
+		if maxPool := cir.ContributionAmount * float64(cir.MaxMembers); input.Amount > maxPool {
+			return nil, fmt.Errorf("payout amount %v exceeds maximum pool %v: %w", input.Amount, maxPool, apperrors.ErrInvalidInput)
 		}
 
 		// OnTime is true only if the round number is valid (1 <= round <= current round)
 		isOnTime = isOnTime && input.RoundNumber <= cir.CurrentRound
+	}
+
+	// Idempotency: return the existing record if this txnHash was already
+	// processed — but ONLY when it belongs to this exact (circle, recipient,
+	// round). A hash replayed across scopes conflicts instead of leaking a
+	// row that is not the caller's.
+	if input.TxnHash != "" {
+		existing, err := s.repo.FindByTxnHash(ctx, input.TxnHash)
+		if err == nil && existing != nil {
+			if existing.CircleID != circleUID || existing.RecipientID != recipientUID ||
+				existing.RoundNumber != input.RoundNumber {
+				return nil, fmt.Errorf("transaction hash already recorded for a different payout: %w",
+					apperrors.ErrConflict)
+			}
+			log.Info().Str("txn_hash", input.TxnHash).Msg("payout already recorded (idempotent replay)")
+			return existing, nil
+		}
 	}
 
 	// Rotation guard (RULE 2 — random payouts rotate without repeat). When
@@ -206,8 +273,10 @@ func (s *service) Record(ctx context.Context, input RecordInput) (*Payout, error
 
 	// Determine verification state — caller may override. Hashes record as
 	// pending for the Arc indexer (2.6), which settles on-chain verification.
-	// Phase 2.8: when a TxVerifier is wired (production), a live receipt
-	// check settles immediately instead of waiting for the indexer.
+	// Phase 2.1: when a TxVerifier is wired and the caller leaves
+	// verification to us, a live receipt check settles immediately —
+	// confirmed receipts record verified, reverted/wrong-contract receipts
+	// are rejected outright, RPC flakes stay pending for the indexer.
 	verifiedOnchain := false
 	verificationStatus := VerificationStatusUnverified
 
@@ -219,7 +288,14 @@ func (s *service) Record(ctx context.Context, input RecordInput) (*Payout, error
 	}
 
 	if input.TxnHash != "" && input.VerifiedOnchain == nil && input.VerificationStatus == nil {
-		verificationStatus = VerificationStatusPending
+		if outcome, reason := s.verifyTxAtRecord(ctx, input.TxnHash, contractAddr, input.Amount); outcome == verifyFailed {
+			return nil, fmt.Errorf("on-chain verification failed: %s", reason)
+		} else if outcome == verifyConfirmed {
+			verifiedOnchain = true
+			verificationStatus = VerificationStatusVerified
+		} else {
+			verificationStatus = VerificationStatusPending
+		}
 	}
 
 	// Guard against duplicate payouts in the same circle/round. A ROSCA round
@@ -252,10 +328,16 @@ func (s *service) Record(ctx context.Context, input RecordInput) (*Payout, error
 
 	if err := s.repo.Create(ctx, p); err != nil {
 		if err == apperrors.ErrConflict {
-			// Race: another request created the same row — return existing.
+			// Race: another request created the same row — return existing,
+			// with the same scope binding as the pre-check.
 			if input.TxnHash != "" {
 				if got, fErr := s.repo.FindByTxnHash(ctx, input.TxnHash); fErr == nil && got != nil {
-					return got, nil
+					if got.CircleID == circleUID && got.RecipientID == recipientUID &&
+						got.RoundNumber == input.RoundNumber {
+						return got, nil
+					}
+					return nil, fmt.Errorf("transaction hash already recorded for a different payout: %w",
+						apperrors.ErrConflict)
 				}
 			}
 		}
@@ -336,8 +418,7 @@ func (s *service) SetCircleService(cs circle.Service) {
 	s.circleService = cs
 }
 
-// SetTxVerifier wires record-time on-chain verification (2.8, parked:
-// stored but not yet consulted by Record).
+// SetTxVerifier wires record-time on-chain verification (2.1).
 func (s *service) SetTxVerifier(v TxVerifier) {
 	s.verifier = v
 }

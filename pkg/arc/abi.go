@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math/big"
+	"strconv"
 	"strings"
 
 	"golang.org/x/crypto/sha3"
@@ -72,6 +73,23 @@ func FloorToERC20(s string) (string, error) {
 	scaled := new(big.Rat).Mul(r, new(big.Rat).SetInt(mult))
 	floored := new(big.Int).Quo(scaled.Num(), scaled.Denom())
 	return FormatUSDC(floored), nil
+}
+
+// USDCFloatToBaseUnits converts a human USDC float to 6-decimal base units,
+// flooring dust. Exact decimal math (no binary-float drift): the shortest
+// decimal rendering parses exactly. For coverage thresholds — never for
+// settlement amounts, which stay exact via ParseUSDC/FloorToERC20.
+func USDCFloatToBaseUnits(f float64) *big.Int {
+	if f <= 0 || f != f || f > 1e15 {
+		return big.NewInt(0)
+	}
+	r, ok := new(big.Rat).SetString(strconv.FormatFloat(f, 'f', -1, 64))
+	if !ok {
+		return big.NewInt(0)
+	}
+	mult := new(big.Int).Exp(big.NewInt(10), big.NewInt(ERC20Decimals), nil)
+	scaled := new(big.Rat).Mul(r, new(big.Rat).SetInt(mult))
+	return new(big.Int).Quo(scaled.Num(), scaled.Denom())
 }
 
 // FormatUSDC converts ERC-20 base units back to a human decimal string.

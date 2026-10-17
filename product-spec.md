@@ -1,5 +1,9 @@
 # Moistello — Stellar Savings Circles (ROSCA)
 
+> HISTORICAL REFERENCE — superseded. Production is Arc EVM, USDC-only (see
+> `/root/UNIFIED-PLAN.md` and `/root/MASTER-PLAN-0.1-10.0.md`). `XLM`/Stellar
+> references below describe the retired rail and must not be reintroduced.
+
 ## Overview
 A decentralized rotating savings and credit association platform built on Stellar/Soroban. Members form savings circles, contribute USDC or XLM each cycle, and one member receives the pooled payout per round. Smart contracts enforce rules, handle randomization/payouts, apply default penalties, and track on-chain reputation. The culturally-universal savings model (esusu, tontine, chit fund, tanda, hui) meets blockchain transparency.
 

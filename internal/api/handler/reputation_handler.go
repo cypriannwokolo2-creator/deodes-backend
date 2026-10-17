@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"strconv"
+
 	"github.com/gin-gonic/gin"
 	"github.com/deodes/backend/internal/api/middleware"
 	"github.com/deodes/backend/internal/domain/reputation"
@@ -88,6 +90,27 @@ func NewReputationHandler(svc reputation.Service) *ReputationHandler {
 // @Router /reputation/tiers [get]
 func (h *ReputationHandler) GetTiers(c *gin.Context) {
 	response.OK(c, gin.H{"tiers": allTiers})
+}
+
+// @Summary Leaderboard top DeoScores
+// @Description Returns the top reputation holders (username, display name, score, tier). No contact data.
+// @Tags Reputation
+// @Produce json
+// @Security BearerAuth
+// @Param limit query int false "Max entries (default 20, max 100)"
+// @Success 200 {object} response.Envelope{data=object{leaders=array}}
+// @Router /reputation/leaderboard [get]
+func (h *ReputationHandler) Leaderboard(c *gin.Context) {
+	limit, _ := strconv.Atoi(c.Query("limit"))
+	leaders, err := h.service.TopScores(c.Request.Context(), limit)
+	if err != nil {
+		response.InternalError(c, "failed to load leaderboard")
+		return
+	}
+	if leaders == nil {
+		leaders = []reputation.LeaderboardEntry{}
+	}
+	response.OK(c, gin.H{"leaders": leaders})
 }
 
 // GetTierByAddress returns the current MoiScore tier for a given user address (user ID).

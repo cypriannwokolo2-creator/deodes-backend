@@ -147,3 +147,112 @@ func TestUSDCTransfer_RejectsBadAmount(t *testing.T) {
 	assert.Error(t, err)
 	assert.True(t, strings.Contains(err.Error(), "connection refused") || strings.Contains(err.Error(), "invalid amount"))
 }
+
+// tagAwareRPC answers eth_getBlockByNumber according to the requested block
+// tag, reproducing Arc mainnet RPC behavior: "pending" fails with -32014
+// "requested data not available" while "latest" succeeds.
+func tagAwareRPC(t *testing.T) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Method string            `json:"method"`
+			Params []json.RawMessage `json:"params"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		w.Header().Set("Content-Type", "application/json")
+		if req.Method == "eth_getBlockByNumber" && len(req.Params) > 0 &&
+			string(req.Params[0]) == `"pending"` {
+			fmt.Fprint(w, `{"jsonrpc":"2.0","id":1,"error":{"code":-32014,"message":"requested data not available"}}`)
+			return
+		}
+		fmt.Fprint(w, `{"jsonrpc":"2.0","id":1,"result":{"baseFeePerGas":"0x3b9aca00"}}`)
+	}
+}
+
+func TestLatestBaseFee_PendingUnavailableFallsBackToLatest(t *testing.T) {
+	srv := httptest.NewServer(tagAwareRPC(t))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, ChainIDTestnet)
+	fee, err := c.LatestBaseFee(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, "1000000000", fee.String())
+}
+
+func TestUSDCTransfer_FeeStepErrorNamesStep(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Method string `json:"method"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		w.Header().Set("Content-Type", "application/json")
+		switch req.Method {
+		case "eth_chainId":
+			fmt.Fprint(w, `{"jsonrpc":"2.0","id":1,"result":"0x4cef52"}`)
+		case "eth_getTransactionCount":
+			fmt.Fprint(w, `{"jsonrpc":"2.0","id":1,"result":"0x5"}`)
+		case "eth_estimateGas":
+			fmt.Fprint(w, `{"jsonrpc":"2.0","id":1,"result":"0xfde8"}`)
+		default:
+			// Fee quote sees pending AND latest fail: the transfer must say
+			// which step broke instead of surfacing a bare rpc error.
+			fmt.Fprint(w, `{"jsonrpc":"2.0","id":1,"error":{"code":-32014,"message":"requested data not available"}}`)
+		}
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, ChainIDTestnet)
+	priv := make([]byte, 32)
+	priv[31] = 1
+	_, err := USDCTransfer(context.Background(), c,
+		"0x0000000000000000000000000000000000000001",
+		priv,
+		"0x742d35Cc6634C0532925a3b844Bc454e4438f44e",
+		"1.25")
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "quoting fees")
+	assert.ErrorContains(t, err, "-32014")
+}
+
+func TestGetTransactionReceipt_ParsesLogs(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"jsonrpc":"2.0","id":1,"result":{
+			"transactionHash":"0xabc","blockNumber":"0x10","to":"0x3600000000000000000000000000000000000000","status":"0x1",
+			"logs":[{
+				"address":"0x3600000000000000000000000000000000000000",
+				"topics":["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+					"0x0000000000000000000000001111111111111111111111111111111111111111",
+					"0x000000000000000000000000742d35cc6634c0532925a3b844bc454e4438f44e"],
+				"data":"0x0000000000000000000000000000000000000000000000000000000001312d00",
+				"blockNumber":"0x10","transactionHash":"0xabc","transactionIndex":"0x0","logIndex":"0x0","removed":false
+			}]
+		}}`)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, ChainIDTestnet)
+	got, err := c.GetTransactionReceipt(context.Background(), "0xabc")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	require.Len(t, got.Logs, 1)
+	assert.Equal(t, "0x3600000000000000000000000000000000000000", got.Logs[0].Address)
+	max := MaxTransferValue(got.Logs, got.To)
+	require.NotNil(t, max)
+	assert.Equal(t, "20000000", max.String())
+}
+
+func TestGetTransactionReceipt_MissingLogsStaysNil(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"jsonrpc":"2.0","id":1,"result":{
+			"transactionHash":"0xabc","blockNumber":"0x10","to":"0x1234","status":"0x1"
+		}}`)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, ChainIDTestnet)
+	got, err := c.GetTransactionReceipt(context.Background(), "0xabc")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Nil(t, got.Logs)
+}

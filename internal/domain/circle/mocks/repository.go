@@ -66,6 +66,14 @@ func (m *Repository) GetMembers(ctx context.Context, circleID uuid.UUID) ([]circ
 	return args.Get(0).([]circle.CircleMember), args.Error(1)
 }
 
+func (m *Repository) SearchMembers(ctx context.Context, circleID uuid.UUID, search string) ([]circle.CircleMember, error) {
+	args := m.Called(ctx, circleID, search)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]circle.CircleMember), args.Error(1)
+}
+
 func (m *Repository) GetMemberCount(ctx context.Context, circleID uuid.UUID) (int, error) {
 	args := m.Called(ctx, circleID)
 	return args.Int(0), args.Error(1)

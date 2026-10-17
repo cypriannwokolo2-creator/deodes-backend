@@ -2,6 +2,7 @@ package verification
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -39,10 +40,30 @@ type Service struct {
 	rdb              *redis.Client
 	sendOTP          func(email, code string) error
 	sendRecoveryCode func(email, code string) error
+	// pepper keys the OTP HMAC (C1): codes were plain SHA256 of 6 digits
+	// (1M space, offline-brute-forceable from any Redis dump). HMAC with a
+	// server-side secret plus the per-recipient email as salt makes dumps
+	// useless without the pepper. Wired from security.wallet_pepper (already
+	// required at boot) in main; empty in tests/dev only.
+	pepper           string
 }
 
 func NewService(rdb *redis.Client) *Service {
 	return &Service{rdb: rdb}
+}
+
+// WithPepper attaches the server-side HMAC pepper. Chainable like WithEmailSender.
+func (s *Service) WithPepper(pepper string) *Service {
+	s.pepper = pepper
+	return s
+}
+
+// hashCode binds a code to its recipient: same code, different email (or
+// pepper) hashes differently, so a leaked hash reveals nothing reusable.
+func (s *Service) hashCode(email, code string) string {
+	mac := hmac.New(sha256.New, []byte(s.pepper))
+	mac.Write([]byte(strings.ToLower(strings.TrimSpace(email)) + "\n" + code))
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 // WithEmailSender attaches email delivery funcs so OTP/recovery codes are
@@ -73,9 +94,8 @@ func (s *Service) SendOTP(ctx context.Context, email string) error {
 		return fmt.Errorf("generating OTP code: %w", err)
 	}
 
-	// Store hashed code in Redis
-	codeHash := sha256.Sum256([]byte(code))
-	hashedCode := hex.EncodeToString(codeHash[:])
+	// Store peppered code in Redis (C1: never plain SHA256 of 6 digits).
+	hashedCode := s.hashCode(email, code)
 	otpKey := fmt.Sprintf("otp:code:%s", email)
 	otpValue := fmt.Sprintf("%s:0", hashedCode) // hash:attempts
 	if err := s.rdb.Set(ctx, otpKey, otpValue, otpTTL).Err(); err != nil {
@@ -117,8 +137,7 @@ func (s *Service) VerifyOTP(ctx context.Context, email, code string) (bool, erro
 		return false, fmt.Errorf("too many incorrect attempts. request a new code")
 	}
 
-	codeHash := sha256.Sum256([]byte(code))
-	hashedCode := hex.EncodeToString(codeHash[:])
+	hashedCode := s.hashCode(email, code)
 
 	if hashedCode == parts[0] {
 		s.rdb.Del(ctx, otpKey)
@@ -140,9 +159,8 @@ func (s *Service) SendRecoveryCode(ctx context.Context, email string) error {
 		return err
 	}
 
-	codeHash := sha256.Sum256([]byte(code))
 	recoveryKey := fmt.Sprintf("recovery:code:%s", email)
-	if err := s.rdb.Set(ctx, recoveryKey, hex.EncodeToString(codeHash[:]), recoveryTTL).Err(); err != nil {
+	if err := s.rdb.Set(ctx, recoveryKey, s.hashCode(email, code), recoveryTTL).Err(); err != nil {
 		return fmt.Errorf("storing recovery code: %w", err)
 	}
 
@@ -165,8 +183,7 @@ func (s *Service) VerifyRecoveryCode(ctx context.Context, email, code string) (b
 		return false, fmt.Errorf("reading recovery code: %w", err)
 	}
 
-	codeHash := sha256.Sum256([]byte(code))
-	if hex.EncodeToString(codeHash[:]) == stored {
+	if s.hashCode(email, code) == stored {
 		s.rdb.Del(ctx, recoveryKey)
 		return true, nil
 	}

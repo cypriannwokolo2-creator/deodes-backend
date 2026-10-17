@@ -39,7 +39,15 @@ func NewAuthHandler(authSvc auth.Service, userSvc user.Service, walletSvc wallet
 	totpSvc *totp.Service, verificationSvc *verification.Service, emailSvc *email.Service,
 	redisClient *redis.Client, userRepo user.Repository) *AuthHandler {
 	if emailSvc != nil {
-		verificationSvc.WithEmailSender(func(address, code string) error { return emailSvc.SendOTP(context.Background(), address, code) }, nil)
+		// Bounded delivery context: the OTP store path already uses the
+		// request context; only the Brevo HTTP call rode on
+		// context.Background() (no timeout/trace). 15s cap, then the
+		// verification error surfaces instead of hanging the request.
+		verificationSvc.WithEmailSender(func(address, code string) error {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			return emailSvc.SendOTP(ctx, address, code)
+		}, nil)
 	}
 	return &AuthHandler{
 		WalletAuthHandler:     NewWalletAuthHandler(authSvc, userSvc),

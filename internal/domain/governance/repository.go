@@ -11,7 +11,7 @@ import (
 type Repository interface {
 	CreateProposal(ctx context.Context, p *Proposal) error
 	GetProposal(ctx context.Context, id uuid.UUID) (*Proposal, error)
-	ListProposals(ctx context.Context, page, limit int) ([]Proposal, int, error)
+	ListProposals(ctx context.Context, page, limit int, search string) ([]Proposal, int, error)
 	// RecordVoteWeighted records a vote together with the weight it was cast
 	// at. The weight is the proposal's creation-time snapshot value, never a
 	// live balance (#418), so the audit trail records the power actually used.

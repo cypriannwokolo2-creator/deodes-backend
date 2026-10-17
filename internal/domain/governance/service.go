@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,7 +38,7 @@ type ProposalExecutor interface {
 
 type Service interface {
 	CreateProposal(ctx context.Context, input CreateProposalInput) (*Proposal, error)
-	ListProposals(ctx context.Context, page, limit int) ([]Proposal, int, error)
+	ListProposals(ctx context.Context, page, limit int, search string) ([]Proposal, int, error)
 	GetProposal(ctx context.Context, id string) (*Proposal, error)
 	VoteProposal(ctx context.Context, proposalID, userID string, vote bool) error
 	ExecuteProposal(ctx context.Context, id string) error
@@ -238,9 +239,9 @@ func (s *service) resolveVoteWeight(ctx context.Context, p *Proposal, voterID uu
 	return weight
 }
 
-func (s *service) ListProposals(ctx context.Context, page, limit int) ([]Proposal, int, error) {
+func (s *service) ListProposals(ctx context.Context, page, limit int, search string) ([]Proposal, int, error) {
 	if s.repo != nil {
-		return s.repo.ListProposals(ctx, page, limit)
+		return s.repo.ListProposals(ctx, page, limit, search)
 	}
 
 	s.mu.RLock()
@@ -248,6 +249,13 @@ func (s *service) ListProposals(ctx context.Context, page, limit int) ([]Proposa
 
 	proposals := make([]Proposal, 0, len(s.proposals))
 	for _, proposal := range s.proposals {
+		if search = strings.TrimSpace(search); search != "" {
+			q := strings.ToLower(search)
+			if !strings.Contains(strings.ToLower(proposal.Title), q) &&
+				!strings.Contains(strings.ToLower(proposal.Description), q) {
+				continue
+			}
+		}
 		proposals = append(proposals, *proposal)
 	}
 	sort.Slice(proposals, func(i, j int) bool {

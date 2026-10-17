@@ -41,6 +41,14 @@ type Service interface {
 	GetBalance(ctx context.Context, userID string) (*Balance, error)
 	SendPayment(ctx context.Context, userID string, passkeySeed []byte, destination, asset string, amount float64, memo, ipAddress, userAgent string) (string, error)
 	DeleteWallet(ctx context.Context, userID, walletID string) error
+	// DailyAllowance reports completed-send volume and the remaining daily
+	// cap for the transfer UI (spent, remaining, limit).
+	DailyAllowance(ctx context.Context, userID string) (spent, remaining, limit float64, err error)
+	// CheckTransferSettlement reports the on-chain settlement of a broadcast
+	// transfer: confirmed (mined, status 1), reverted (mined, status 0), or
+	// neither when unmined or the node is unreachable. Unknown must not block
+	// callers — it is a second opinion, not a gate.
+	CheckTransferSettlement(ctx context.Context, txHash string) (confirmed, reverted bool)
 }
 
 type Config struct {
@@ -55,12 +63,48 @@ type Config struct {
 	ArcRPCURL       string
 	ArcChainID      uint64
 	ArcUSDCContract string
+	// DailySendLimitUSD caps completed sends per rolling 24h (C2): a stolen
+	// session can otherwise drain the custodial wallet 3 sends/hour forever.
+	// Zero or negative means uncapped (dev default is set in config).
+	DailySendLimitUSD float64
 }
 
 type service struct {
 	repo Repository
 	cfg  Config
 	arc  *arc.Client
+}
+
+// ErrInsufficientFunds is returned when the on-chain balance cannot cover a
+// send. Callers surface the shortfall amounts in the wrapped message.
+var ErrInsufficientFunds = errors.New("insufficient wallet balance")
+
+// ErrNoHostedWallet is returned when the sender has no hosted Arc wallet yet.
+var ErrNoHostedWallet = errors.New("no hosted Arc wallet found")
+
+// ErrSendRateLimited is returned when the sender exceeds 3 sends per hour.
+var ErrSendRateLimited = errors.New("withdrawal rate limit exceeded")
+
+// ErrDailySendLimitExceeded is returned when a send would breach the rolling
+// 24h value cap.
+var ErrDailySendLimitExceeded = errors.New("daily send limit exceeded")
+
+// ErrAmountTooSmall is returned when the amount floors to zero base units:
+// broadcasting it would burn gas moving nothing.
+var ErrAmountTooSmall = errors.New("amount too small to settle on-chain")
+
+// ErrWalletFrozen is returned when the sender's hosted wallet is frozen by
+// admin moderation. Inbound deposits are unaffected; only outbound sends stop.
+var ErrWalletFrozen = errors.New("sending is paused on this account pending review")
+
+// chainBalance reads the on-chain USDC balance for a 0x address. RPC flakes
+// propagate as errors so callers can fail closed.
+func (s *service) chainBalance(ctx context.Context, address string) (float64, error) {
+	human, err := arc.USDCBalanceOf(ctx, s.arc, s.cfg.ArcUSDCContract, address)
+	if err != nil {
+		return 0, err
+	}
+	return strconv.ParseFloat(human, 64)
 }
 
 func NewService(repo Repository, cfg Config) (Service, error) {
@@ -104,12 +148,22 @@ func (s *service) CreateWallet(ctx context.Context, userID string, passkeySeed [
 	// Persist the secret encrypted when an encryption key is configured.
 	// Legacy callers without a key keep watch-only semantics, but store
 	// empty (non-nil) bytea so the NOT NULL columns never receive NULL.
-	if key, err := crypto.ParseEncryptionKey(strings.TrimSpace(s.cfg.EncryptionKey)); err == nil {
-		ct, nonce, err := crypto.Encrypt(rawSeed[:], key)
-		if err == nil {
-			w.EncryptedSecretKey = ct
-			w.EncryptionNonce = nonce
+	// A configured key that fails to parse or encrypt is a hard error:
+	// silently storing an unspendable wallet is worse than failing creation.
+	if strings.TrimSpace(s.cfg.EncryptionKey) == "" {
+		l := logger.Ctx(ctx)
+		l.Warn().Str("userID", userID).Msg("creating watch-only wallet: no encryption key configured")
+	} else {
+		key, err := crypto.ParseEncryptionKey(strings.TrimSpace(s.cfg.EncryptionKey))
+		if err != nil {
+			return nil, fmt.Errorf("create wallet requires a valid encryption key: %w", err)
 		}
+		ct, nonce, err := crypto.Encrypt(rawSeed[:], key)
+		if err != nil {
+			return nil, fmt.Errorf("encrypting wallet secret: %w", err)
+		}
+		w.EncryptedSecretKey = ct
+		w.EncryptionNonce = nonce
 	}
 
 	if s.repo != nil {
@@ -248,6 +302,23 @@ func (s *service) GetWallets(ctx context.Context, userID string) ([]Wallet, erro
 	return s.repo.FindByUserID(ctx, userID)
 }
 
+// CheckTransferSettlement implements Service.
+func (s *service) CheckTransferSettlement(ctx context.Context, txHash string) (confirmed, reverted bool) {
+	if s.arc == nil || strings.TrimSpace(txHash) == "" {
+		return false, false
+	}
+	rctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	receipt, err := s.arc.GetTransactionReceipt(rctx, txHash)
+	if err != nil || receipt == nil || !receipt.Found {
+		return false, false
+	}
+	if receipt.Status == 1 {
+		return true, false
+	}
+	return false, true
+}
+
 func (s *service) GetBalance(ctx context.Context, userID string) (*Balance, error) {
 	wallets, err := s.GetWallets(ctx, userID)
 	if err != nil {
@@ -266,7 +337,7 @@ func (s *service) GetBalance(ctx context.Context, userID string) (*Balance, erro
 			if err != nil {
 				return nil, fmt.Errorf("parsing balance: %w", err)
 			}
-			return &Balance{XLM: 0, USDC: f}, nil
+			return &Balance{USDC: f}, nil
 		}
 	}
 	// Legacy (non-0x) wallets predate the Arc migration: no chain left to
@@ -285,8 +356,20 @@ func (s *service) SendPayment(ctx context.Context, userID string, passkeySeed []
 	if asset != "" && asset != "USDC" {
 		return "", fmt.Errorf("unsupported asset %q: hosted sends settle in USDC on Arc", asset)
 	}
+	uid, parseErr := uuid.Parse(userID)
+	if s.repo != nil && parseErr != nil {
+		return "", fmt.Errorf("invalid user id for audited send")
+	}
+	// Every rejection below is audit-trailed (failed, with reason): shortfall
+	// and probing attempts must be visible, not just successes and throttles.
+	auditFail := func(failure string) {
+		if s.repo != nil {
+			s.auditWithdrawal(ctx, uid, destination, asset, amt.String(), ipAddress, userAgent, "", "failed", failure)
+		}
+	}
 	wallets, err := s.GetWallets(ctx, userID)
 	if err != nil {
+		auditFail("listing wallets: " + err.Error())
 		return "", err
 	}
 	var hosted *Wallet
@@ -297,47 +380,111 @@ func (s *service) SendPayment(ctx context.Context, userID string, passkeySeed []
 		}
 	}
 	if hosted == nil {
-		return "", fmt.Errorf("no hosted Arc wallet found. Create one first.")
+		auditFail("no hosted Arc wallet")
+		return "", fmt.Errorf("%w. Create one first.", ErrNoHostedWallet)
 	}
-	key, err := crypto.ParseEncryptionKey(strings.TrimSpace(s.cfg.EncryptionKey))
+	// FindByUserID (behind GetWallets) intentionally omits the encrypted
+	// secret columns, so the candidate above never carries key material.
+	// Re-fetch the secret-bearing row by ID before signing; without this
+	// every hosted send fails with "wallet has no encrypted secret key".
+	// hosted is non-nil here, which implies s.repo is non-nil.
+	full, err := s.repo.FindByID(ctx, hosted.ID)
 	if err != nil {
-		return "", fmt.Errorf("hosted sends require a configured encryption key: %w", err)
+		auditFail("loading hosted wallet: " + err.Error())
+		return "", fmt.Errorf("loading hosted wallet for send: %w", err)
 	}
-	_ = passkeySeed // Reserved for future step-up auth binding; decrypt uses the server key.
-	_ = memo        // EVM USDC transfers carry no memo field.
-	secret, err := hosted.DecryptSecret(key)
-	if err != nil {
-		return "", err
+	if full == nil {
+		auditFail("no hosted Arc wallet")
+		return "", fmt.Errorf("%w. Create one first.", ErrNoHostedWallet)
 	}
-	privKey := []byte(secret)
-	if len(privKey) != 32 {
-		return "", fmt.Errorf("hosted secret has invalid length %d", len(privKey))
+	hosted = full
+	// Frozen wallets cannot send (admin moderation for suspicious activity).
+	// The check runs before any chain or key touch so a frozen account can
+	// never sign or broadcast; deposits (inbound) are unaffected.
+	if hosted.Frozen {
+		auditFail("wallet frozen by moderation")
+		return "", ErrWalletFrozen
 	}
-
-	uid, parseErr := uuid.Parse(userID)
-	if s.repo != nil && parseErr != nil {
-		return "", fmt.Errorf("invalid user id for audited send")
-	}
-	if s.repo != nil {
-		allowed, err := s.repo.CheckRateLimit(ctx, uid)
-		if err != nil {
-			return "", err
-		}
-		if !allowed {
-			s.auditWithdrawal(ctx, uid, destination, asset, amt.String(), ipAddress, userAgent, "", "failed", "rate limited")
-			return "", fmt.Errorf("withdrawal rate limit exceeded: max 3 per hour")
-		}
-		if err := s.repo.IncrementRateLimit(ctx, uid); err != nil {
-			return "", err
-		}
-	}
-
 	// Quantize to ERC-20 precision BEFORE touching the chain: Money carries
 	// 7 decimals, the interface settles 6. Dust below $0.000001 stays in the
 	// wallet; everything recorded below uses the floored (actual) value.
 	sendAmount, err := arc.FloorToERC20(amt.String())
 	if err != nil {
 		return "", fmt.Errorf("invalid amount: %w", err)
+	}
+	if dust, derr := arc.ParseUSDC(sendAmount); derr != nil || dust.Sign() <= 0 {
+		auditFail("dust amount below $0.000001 USDC")
+		return "", fmt.Errorf("%w: minimum is $0.000001 USDC", ErrAmountTooSmall)
+	}
+	// Sufficiency pre-check (T020): fail before signing when the on-chain
+	// balance cannot cover amount PLUS the network fee. Arc charges gas in
+	// USDC from the same balance, so an amount-only check lets full-balance
+	// sends through to revert on-chain (burning gas) instead of failing here.
+	feeUSDC, err := arc.EstimateTransferFee(ctx, s.arc, s.cfg.ArcUSDCContract, hosted.PublicKey, destination, sendAmount)
+	if err != nil {
+		auditFail("estimating network fee: " + err.Error())
+		return "", fmt.Errorf("estimating network fee: %w", err)
+	}
+	bal, err := s.chainBalance(ctx, hosted.PublicKey)
+	if err != nil {
+		// Fail closed: without a balance reading we cannot prove sufficiency,
+		// and proceeding would turn into an on-chain revert that still burns
+		// gas. The caller should retry once the node answers.
+		auditFail("balance read failed: " + err.Error())
+		return "", fmt.Errorf("could not verify wallet balance, please try again: %w", err)
+	}
+	if bal < amt.Float64()+feeUSDC {
+		auditFail(fmt.Sprintf("insufficient balance %.2f for %.2f plus fee", bal, amt.Float64()))
+		return "", fmt.Errorf("insufficient wallet balance %.2f USDC for %.2f USDC send plus ~%.4f USDC network fee: %w",
+			bal, amt.Float64(), feeUSDC, ErrInsufficientFunds)
+	}
+	key, err := crypto.ParseEncryptionKey(strings.TrimSpace(s.cfg.EncryptionKey))
+	if err != nil {
+		auditFail("encryption key misconfigured")
+		return "", fmt.Errorf("hosted sends require a configured encryption key: %w", err)
+	}
+	_ = passkeySeed // Reserved for future step-up auth binding; decrypt uses the server key.
+	_ = memo        // EVM USDC transfers carry no memo field.
+	secret, err := hosted.DecryptSecret(key)
+	if err != nil {
+		auditFail("decrypting wallet secret: " + err.Error())
+		return "", err
+	}
+	privKey := []byte(secret)
+	if len(privKey) != 32 {
+		auditFail(fmt.Sprintf("hosted secret has invalid length %d", len(privKey)))
+		return "", fmt.Errorf("hosted secret has invalid length %d", len(privKey))
+	}
+
+	if s.repo != nil {
+		allowed, err := s.repo.CheckRateLimit(ctx, uid)
+		if err != nil {
+			auditFail("checking rate limit: " + err.Error())
+			return "", err
+		}
+		if !allowed {
+			s.auditWithdrawal(ctx, uid, destination, asset, amt.String(), ipAddress, userAgent, "", "failed", "rate limited")
+			return "", fmt.Errorf("%w: max 3 per hour", ErrSendRateLimited)
+		}
+		if err := s.repo.IncrementRateLimit(ctx, uid); err != nil {
+			auditFail("recording rate limit: " + err.Error())
+			return "", err
+		}
+	}
+
+	// Daily value cap (C2): count-based throttling alone lets a compromised
+	// session exfiltrate without bound. Failed/low-balance sends never reach
+	// the chain, so only completed volume counts (see auditWithdrawal).
+	if s.cfg.DailySendLimitUSD > 0 {
+		spent, err := s.repo.GetDailySpending(ctx, uid)
+		if err != nil {
+			auditFail("checking daily send limit: " + err.Error())
+			return "", fmt.Errorf("checking daily send limit: %w", err)
+		}
+		if amt.Float64()+spent > s.cfg.DailySendLimitUSD {
+			s.auditWithdrawal(ctx, uid, destination, asset, amt.String(), ipAddress, userAgent, "", "failed", "daily send limit exceeded")
+			return "", fmt.Errorf("%w: max %.2f USDC per 24h", ErrDailySendLimitExceeded, s.cfg.DailySendLimitUSD)
+		}
 	}
 
 	txHash, err := arc.USDCTransfer(ctx, s.arc, s.cfg.ArcUSDCContract, privKey, destination, sendAmount)
@@ -384,4 +531,24 @@ func (s *service) DeleteWallet(ctx context.Context, userID, walletID string) err
 		return nil
 	}
 	return s.repo.DeleteByOwner(ctx, walletID, userID)
+}
+
+func (s *service) DailyAllowance(ctx context.Context, userID string) (float64, float64, float64, error) {
+	limit := s.cfg.DailySendLimitUSD
+	if limit <= 0 || s.repo == nil {
+		return 0, limit, limit, nil
+	}
+	uid, err := uuid.Parse(userID)
+	if err != nil {
+		return 0, 0, limit, fmt.Errorf("invalid user id: %w", err)
+	}
+	spent, err := s.repo.GetDailySpending(ctx, uid)
+	if err != nil {
+		return 0, 0, limit, fmt.Errorf("checking daily send volume: %w", err)
+	}
+	remaining := limit - spent
+	if remaining < 0 {
+		remaining = 0
+	}
+	return spent, remaining, limit, nil
 }

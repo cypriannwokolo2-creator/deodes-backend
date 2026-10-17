@@ -55,7 +55,7 @@ func TestCircleService_Create_Validation(t *testing.T) {
 		{"zero contribution", func(i *circle.CreateCircleInput) { i.ContributionAmount = 0 }},
 		{"negative contribution", func(i *circle.CreateCircleInput) { i.ContributionAmount = -5 }},
 		{"over-max contribution", func(i *circle.CreateCircleInput) { i.ContributionAmount = 1_000_001 }},
-		{"XLM currency rejected", func(i *circle.CreateCircleInput) { i.Currency = circle.CurrencyXLM }},
+		{"non-USDC currency rejected", func(i *circle.CreateCircleInput) { i.Currency = circle.CircleCurrency("XLM") }},
 		{"bad frequency", func(i *circle.CreateCircleInput) { i.Frequency = "yearly" }},
 		{"bad circle type", func(i *circle.CreateCircleInput) { i.CircleType = "secret" }},
 		{"bad payout type", func(i *circle.CreateCircleInput) { i.PayoutType = "lottery" }},
@@ -144,7 +144,7 @@ func TestCircleService_Update_Validation(t *testing.T) {
 	longName := strings.Repeat("a", 101)
 	zero := 0.0
 	overMax := 1_000_001.0
-	badCurrency := circle.CurrencyXLM
+	badCurrency := circle.CircleCurrency("XLM")
 	badFreq := circle.CircleFrequency("yearly")
 	oneMember := 1
 	manyMembers := 101
@@ -164,7 +164,7 @@ func TestCircleService_Update_Validation(t *testing.T) {
 		{"long name", circle.UpdateCircleInput{Name: &longName}},
 		{"zero contribution", circle.UpdateCircleInput{ContributionAmount: &zero}},
 		{"over-max contribution", circle.UpdateCircleInput{ContributionAmount: &overMax}},
-		{"XLM currency", circle.UpdateCircleInput{Currency: &badCurrency}},
+		{"non-USDC currency", circle.UpdateCircleInput{Currency: &badCurrency}},
 		{"bad frequency", circle.UpdateCircleInput{Frequency: &badFreq}},
 		{"one member", circle.UpdateCircleInput{MaxMembers: &oneMember}},
 		{"too many members", circle.UpdateCircleInput{MaxMembers: &manyMembers}},

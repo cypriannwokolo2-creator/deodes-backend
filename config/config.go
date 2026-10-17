@@ -33,6 +33,7 @@ type Config struct {
 	Environment  string
 	Tracing      TracingConfig
 	Swap         SwapConfig        `mapstructure:"swap"`
+	Transfer     TransferConfig    `mapstructure:"transfer"`
 	MobileMoney  MobileMoneyConfig `mapstructure:"mobile_money"`
 	Governance   GovernanceConfig  `mapstructure:"governance"`
 	Arc          ArcConfig         `mapstructure:"arc"`
@@ -69,6 +70,12 @@ type ServerConfig struct {
 	// by the Gin route pattern (e.g. "/v1/wallets/withdraw"). Use it for
 	// endpoints that legitimately accept larger payloads than the default.
 	MaxBodyBytesRoutes map[string]int64 `mapstructure:"max_body_bytes_routes"`
+	// TrustedProxies is the list of CIDRs / IPs whose X-Forwarded-For we
+	// trust when deriving c.ClientIP() for rate limiting. Must include the
+	// LB/CDN in front of deodes.com, otherwise every client collapses to
+	// the proxy IP and shares one OTP bucket (always-429). Empty = trust
+	// loopback only (secure default for direct-connect dev).
+	TrustedProxies []string `mapstructure:"trusted_proxies"`
 }
 
 type DatabaseConfig struct {
@@ -209,6 +216,9 @@ type BrevoConfig struct {
 	APIKey    string `mapstructure:"api_key"`
 	FromEmail string `mapstructure:"from_email"`
 	FromName  string `mapstructure:"from_name"`
+	// TempSenderNotice appends the temporary-sender footer to code emails.
+	// Flip back to false when the canonical domain is restored.
+	TempSenderNotice bool `mapstructure:"temp_sender_notice"`
 }
 
 type IndexerConfig struct {
@@ -264,6 +274,13 @@ type SwapConfig struct {
 	SweepInterval time.Duration `mapstructure:"sweep_interval"`
 }
 
+// TransferConfig bounds member-to-member and withdrawal sends (C2).
+type TransferConfig struct {
+	// DailyLimitUSD caps completed sends per rolling 24h across withdraw +
+	// transfer (both settle via SendPayment). Zero/negative disables.
+	DailyLimitUSD float64 `mapstructure:"daily_limit_usd"`
+}
+
 // GovernanceConfig holds the execution timelock settings (#414).
 type GovernanceConfig struct {
 	// ExecutionTimelock is how long a proposal that has passed its vote waits
@@ -294,8 +311,29 @@ type RateLimitConfig struct {
 	// existed but was never applied to any route — these give the
 	// high-value/sensitive resources their own configurable, tighter buckets
 	// instead of sharing the coarse Global/Authenticated/Auth limits above.
-	OTPLimit                    int `mapstructure:"otp_limit"`
-	OTPWindowSeconds            int `mapstructure:"otp_window_seconds"`
+	OTPLimit         int `mapstructure:"otp_limit"`
+	OTPWindowSeconds int `mapstructure:"otp_window_seconds"`
+	// Split OTP buckets (fix for always-429 on verify): send and verify used
+	// to share one "otp" bucket (5/15m for 6 endpoints), so 1 register + 1
+	// typo + 1 resend = locked. Zero falls back to OTPLimit/OTPWindowSeconds.
+	OTPSendLimit           int `mapstructure:"otp_send_limit"`
+	OTPSendWindowSeconds   int `mapstructure:"otp_send_window_seconds"`
+	OTPVerifyLimit         int `mapstructure:"otp_verify_limit"`
+	OTPVerifyWindowSeconds int `mapstructure:"otp_verify_window_seconds"`
+	// Login bucket (login + google never sent OTP but shared the OTP bucket).
+	// Zero falls back to OTPLimit/OTPWindowSeconds.
+	LoginLimit         int `mapstructure:"login_limit"`
+	LoginWindowSeconds int `mapstructure:"login_window_seconds"`
+	// Public invite preview (landing page): high-entropy codes need no
+	// strict bucket, but unauthenticated enumeration must stay bounded.
+	InvitePreviewLimit         int `mapstructure:"invite_preview_limit"`
+	InvitePreviewWindowSeconds int `mapstructure:"invite_preview_window_seconds"`
+	// Anonymous-write buckets (claim-name allocates names, consent writes
+	// records — both unauthenticated and previously unlimited).
+	ClaimLimit                  int `mapstructure:"claim_limit"`
+	ClaimWindowSeconds          int `mapstructure:"claim_window_seconds"`
+	ConsentLimit                int `mapstructure:"consent_limit"`
+	ConsentWindowSeconds        int `mapstructure:"consent_window_seconds"`
 	SwapLimit                   int `mapstructure:"swap_limit"`
 	SwapWindowSeconds           int `mapstructure:"swap_window_seconds"`
 	ContributeLimit             int `mapstructure:"contribute_limit"`
@@ -309,6 +347,41 @@ type RateLimitConfig struct {
 	PasswordResetWindowSeconds  int `mapstructure:"password_reset_window_seconds"`
 	AdminLimit                  int `mapstructure:"admin_limit"`
 	AdminWindowSeconds          int `mapstructure:"admin_window_seconds"`
+}
+
+// resolveWithFallback returns limit/window, falling back to the legacy OTP
+// bucket when the split bucket is unset (zero). Keeps old configs and tests
+// that only set otp_limit working.
+func (r RateLimitConfig) resolveWithFallback(limit, window int) (int, int) {
+	if limit <= 0 {
+		limit = r.OTPLimit
+	}
+	if window <= 0 {
+		window = r.OTPWindowSeconds
+	}
+	if limit <= 0 {
+		limit = 5
+	}
+	if window <= 0 {
+		window = 900
+	}
+	return limit, window
+}
+
+// OTPSend returns the send-code bucket (register, password/forgot).
+func (r RateLimitConfig) OTPSend() (int, int) {
+	return r.resolveWithFallback(r.OTPSendLimit, r.OTPSendWindowSeconds)
+}
+
+// OTPVerify returns the verify-code bucket (register/verify, password/reset).
+// Deliberately roomier than send: typos must not lock the user for 15m.
+func (r RateLimitConfig) OTPVerify() (int, int) {
+	return r.resolveWithFallback(r.OTPVerifyLimit, r.OTPVerifyWindowSeconds)
+}
+
+// Login returns the login/google bucket (never shared with OTP).
+func (r RateLimitConfig) Login() (int, int) {
+	return r.resolveWithFallback(r.LoginLimit, r.LoginWindowSeconds)
 }
 
 type LoggingConfig struct {
@@ -389,7 +462,7 @@ func Load(path string) (*Config, error) {
 	// would be indistinguishable from an operator's explicit choice and would
 	// make ResolveCORSAllowedOrigins return it in every environment (#348).
 	setDefault(v, "cors.allowed_methods", []string{"GET", "POST", "PATCH", "DELETE", "OPTIONS"})
-	setDefault(v, "cors.allowed_headers", []string{"Authorization", "Content-Type", "X-Request-ID"})
+	setDefault(v, "cors.allowed_headers", DefaultCORSAllowedHeaders())
 	setDefault(v, "cors.allow_credentials", true)
 	setDefault(v, "cors.max_age", "24h")
 	setDefault(v, "rate_limit.global", 100)
@@ -398,6 +471,18 @@ func Load(path string) (*Config, error) {
 	setDefault(v, "rate_limit.fail_closed", true)
 	setDefault(v, "rate_limit.otp_limit", 5)
 	setDefault(v, "rate_limit.otp_window_seconds", 900)
+	setDefault(v, "rate_limit.otp_send_limit", 5)
+	setDefault(v, "rate_limit.otp_send_window_seconds", 900)
+	setDefault(v, "rate_limit.otp_verify_limit", 15)
+	setDefault(v, "rate_limit.otp_verify_window_seconds", 900)
+	setDefault(v, "rate_limit.login_limit", 20)
+	setDefault(v, "rate_limit.login_window_seconds", 900)
+	setDefault(v, "rate_limit.invite_preview_limit", 30)
+	setDefault(v, "rate_limit.invite_preview_window_seconds", 60)
+	setDefault(v, "rate_limit.claim_limit", 20)
+	setDefault(v, "rate_limit.claim_window_seconds", 3600)
+	setDefault(v, "rate_limit.consent_limit", 30)
+	setDefault(v, "rate_limit.consent_window_seconds", 3600)
 	setDefault(v, "rate_limit.swap_limit", 10)
 	setDefault(v, "rate_limit.swap_window_seconds", 60)
 	setDefault(v, "rate_limit.contribute_limit", 10)
@@ -421,6 +506,7 @@ func Load(path string) (*Config, error) {
 	setDefault(v, "notification.sms.from_number", "")
 	setDefault(v, "notification.push.fcm_server_key", "")
 	setDefault(v, "swap.sweep_interval", "1m")
+	setDefault(v, "transfer.daily_limit_usd", 1000)
 	// #414: a passed proposal waits 48h before it can be executed, giving
 	// members time to review it and cancel it. Set to "0" to execute immediately.
 	setDefault(v, "governance.execution_timelock", "48h")
@@ -439,6 +525,7 @@ func Load(path string) (*Config, error) {
 	mustBindEnv(v, "arc.treasury_address", "DEODES_TREASURY_ADDRESS", "ARC_TREASURY_ADDRESS")
 	mustBindEnv(v, "keeper.escrow_address", "DEODES_KEEPER_ESCROW_ADDRESS", "KEEPER_ESCROW_ADDRESS")
 	mustBindEnv(v, "keeper.interval_minutes", "DEODES_KEEPER_INTERVAL_MINUTES", "KEEPER_INTERVAL_MINUTES")
+	mustBindEnv(v, "transfer.daily_limit_usd", "DEODES_TRANSFER_DAILY_LIMIT_USD")
 	mustBindEnv(v, "security.wallet_pepper", "DEODES_SECURITY_WALLET_PEPPER", "DEODES_WALLET_PEPPER")
 	mustBindEnv(v, "security.encryption_key", "DEODES_SECURITY_ENCRYPTION_KEY", "ENCRYPTION_KEY")
 	mustBindEnv(v, "auth.jwt_private_key_pem", "DEODES_AUTH_JWT_PRIVATE_KEY_PEM", "JWT_PRIVATE_KEY")
@@ -451,11 +538,25 @@ func Load(path string) (*Config, error) {
 	mustBindEnv(v, "google.client_id", "DEODES_GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_ID")
 	mustBindEnv(v, "brevo.from_email", "DEODES_BREVO_FROM_EMAIL", "DEODES_NOTIFICATION_EMAIL_FROM_ADDRESS")
 	mustBindEnv(v, "brevo.from_name", "DEODES_BREVO_FROM_NAME", "DEODES_NOTIFICATION_EMAIL_FROM_NAME")
+	mustBindEnv(v, "brevo.temp_sender_notice", "DEODES_BREVO_TEMP_SENDER_NOTICE")
 	mustBindEnv(v, "cors.allowed_origins", "DEODES_CORS_ALLOWED_ORIGINS", "ALLOWED_ORIGINS")
 	mustBindEnv(v, "redis.url", "DEODES_REDIS_URL", "REDIS_URL")
 	mustBindEnv(v, "redis.password", "DEODES_REDIS_PASSWORD", "REDIS_PASSWORD")
 	mustBindEnv(v, "auth.admin_api_key", "DEODES_AUTH_ADMIN_API_KEY", "ADMIN_API_KEY")
 	mustBindEnv(v, "auth.admin_api_key_secondary", "DEODES_AUTH_ADMIN_API_KEY_SECONDARY", "ADMIN_API_KEY_SECONDARY")
+	mustBindEnv(v, "server.trusted_proxies", "DEODES_TRUSTED_PROXIES", "TRUSTED_PROXIES")
+	mustBindEnv(v, "rate_limit.otp_send_limit", "DEODES_RATE_LIMIT_OTP_SEND_LIMIT")
+	mustBindEnv(v, "rate_limit.otp_send_window_seconds", "DEODES_RATE_LIMIT_OTP_SEND_WINDOW")
+	mustBindEnv(v, "rate_limit.otp_verify_limit", "DEODES_RATE_LIMIT_OTP_VERIFY_LIMIT")
+	mustBindEnv(v, "rate_limit.otp_verify_window_seconds", "DEODES_RATE_LIMIT_OTP_VERIFY_WINDOW")
+	mustBindEnv(v, "rate_limit.login_limit", "DEODES_RATE_LIMIT_LOGIN_LIMIT")
+	mustBindEnv(v, "rate_limit.login_window_seconds", "DEODES_RATE_LIMIT_LOGIN_WINDOW")
+	mustBindEnv(v, "rate_limit.invite_preview_limit", "DEODES_RATE_LIMIT_INVITE_PREVIEW_LIMIT")
+	mustBindEnv(v, "rate_limit.invite_preview_window_seconds", "DEODES_RATE_LIMIT_INVITE_PREVIEW_WINDOW")
+	mustBindEnv(v, "rate_limit.claim_limit", "DEODES_RATE_LIMIT_CLAIM_LIMIT")
+	mustBindEnv(v, "rate_limit.claim_window_seconds", "DEODES_RATE_LIMIT_CLAIM_WINDOW")
+	mustBindEnv(v, "rate_limit.consent_limit", "DEODES_RATE_LIMIT_CONSENT_LIMIT")
+	mustBindEnv(v, "rate_limit.consent_window_seconds", "DEODES_RATE_LIMIT_CONSENT_WINDOW")
 	v.SetDefault("auth.admin_api_key", "")
 	v.SetDefault("auth.admin_api_key_secondary", "")
 	v.SetDefault("server.port", 1100)
@@ -490,6 +591,7 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("brevo.api_key", "")
 	v.SetDefault("brevo.from_email", "noreply@deodes.com")
 	v.SetDefault("brevo.from_name", "Deodes")
+	v.SetDefault("brevo.temp_sender_notice", false)
 	v.SetDefault("indexer.poll_interval", "3s")
 	v.SetDefault("indexer.batch_size", 50)
 	v.SetDefault("indexer.max_cursor_lag", "2m")
@@ -497,7 +599,7 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("indexer.stall_threshold", "5m")
 	// See the note above: no default for cors.allowed_origins (#348).
 	v.SetDefault("cors.allowed_methods", []string{"GET", "POST", "PATCH", "DELETE", "OPTIONS"})
-	v.SetDefault("cors.allowed_headers", []string{"Authorization", "Content-Type", "X-Request-ID"})
+	v.SetDefault("cors.allowed_headers", DefaultCORSAllowedHeaders())
 	v.SetDefault("cors.allow_credentials", true)
 	v.SetDefault("cors.max_age", "24h")
 	v.SetDefault("rate_limit.global", 100)
@@ -506,6 +608,18 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("rate_limit.fail_closed", true)
 	v.SetDefault("rate_limit.otp_limit", 5)
 	v.SetDefault("rate_limit.otp_window_seconds", 900)
+	v.SetDefault("rate_limit.otp_send_limit", 5)
+	v.SetDefault("rate_limit.otp_send_window_seconds", 900)
+	v.SetDefault("rate_limit.otp_verify_limit", 15)
+	v.SetDefault("rate_limit.otp_verify_window_seconds", 900)
+	v.SetDefault("rate_limit.login_limit", 20)
+	v.SetDefault("rate_limit.login_window_seconds", 900)
+	v.SetDefault("rate_limit.invite_preview_limit", 30)
+	v.SetDefault("rate_limit.invite_preview_window_seconds", 60)
+	v.SetDefault("rate_limit.claim_limit", 20)
+	v.SetDefault("rate_limit.claim_window_seconds", 3600)
+	v.SetDefault("rate_limit.consent_limit", 30)
+	v.SetDefault("rate_limit.consent_window_seconds", 3600)
 	v.SetDefault("rate_limit.swap_limit", 10)
 	v.SetDefault("rate_limit.swap_window_seconds", 60)
 	v.SetDefault("rate_limit.contribute_limit", 10)

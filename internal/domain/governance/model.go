@@ -199,5 +199,7 @@ type CreateProposalInput struct {
 }
 
 type VoteProposalInput struct {
-	Vote bool `json:"vote" binding:"required"`
+	// Pointer so "against" (false) is distinguishable from absent:
+	// binding:"required" on a plain bool rejects false.
+	Vote *bool `json:"vote" binding:"required"`
 }

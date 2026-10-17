@@ -1,10 +1,10 @@
 package handler
 
 import (
-	"github.com/gin-gonic/gin"
 	"github.com/deodes/backend/internal/api/middleware"
 	"github.com/deodes/backend/internal/domain/incentives"
 	"github.com/deodes/backend/pkg/response"
+	"github.com/gin-gonic/gin"
 )
 
 // ReferralHandler exposes the referral-system endpoints.
@@ -89,4 +89,34 @@ func (h *ReferralHandler) GetHistory(c *gin.Context) {
 	}
 
 	response.OK(c, gin.H{"referrals": referrals})
+}
+
+// @Summary Apply a referral code
+// @Description Attributes the caller to the referrer holding the code.
+// @Tags Referral
+// @Accept json
+// @Produce json
+// @Security BearerAuth
+// @Param body body object true "Referral code" {"referralCode":"string"}
+// @Success 200 {object} response.Envelope{data=object{success=bool}}
+// @Failure 400 {object} response.Envelope
+// @Router /referral/apply [post]
+func (h *ReferralHandler) ApplyCode(c *gin.Context) {
+	userID := middleware.GetUserID(c)
+	if userID == "" {
+		response.Unauthorized(c, "authentication required")
+		return
+	}
+	var req struct {
+		ReferralCode string `json:"referralCode" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	if err := h.service.ApplyReferralCode(c.Request.Context(), userID, req.ReferralCode); err != nil {
+		response.BadRequest(c, "invalid or already-used referral code")
+		return
+	}
+	response.OK(c, gin.H{"success": true})
 }

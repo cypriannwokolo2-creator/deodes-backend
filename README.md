@@ -80,7 +80,7 @@ POST /circles               → Create with name, type, payout mode
 GET /circles                → List user's circles
 GET /circles/{id}           → Details with rounds/members
 POST /circles/{id}/join      → Join circle with deposit
-POST /circles/{id}/contribute → Submit USDC/XLM payment
+POST /circles/{id}/contribute → Submit USDC payment (Arc EVM)
 POST /circles/{id}/payout    → Trigger distribution
 ```
 

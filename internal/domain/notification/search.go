@@ -35,7 +35,7 @@ func buildSearchConditions(userID uuid.UUID, f SearchFilter) (string, []any) {
 		conds = append(conds, "is_read = false")
 	}
 	if f.Type != "" {
-		args = append(args, string(f.Type))
+		args = append(args, string(dbNotificationType(f.Type)))
 		conds = append(conds, fmt.Sprintf("type = $%d", len(args)))
 	}
 	if q := strings.TrimSpace(f.Query); q != "" {

@@ -172,7 +172,7 @@ func (h *CircleHandler) ListCircles(c *gin.Context) {
 	// Arc USDC only: the browser's currency toggle maps straight through.
 	// Unknown values are ignored rather than filtering everything out.
 	switch cur := circle.CircleCurrency(c.Query("currency")); cur {
-	case circle.CurrencyUSDC, circle.CurrencyXLM:
+	case circle.CurrencyUSDC:
 		filter.Currency = cur
 	}
 	// Sort keys mirror the frontend browser (date/name/amount/members); the
@@ -244,6 +244,8 @@ func writeCircleError(c *gin.Context, err error, action string) {
 		response.BadRequest(c, err.Error())
 	case errors.Is(err, circle.ErrCircleFull):
 		response.BadRequest(c, err.Error())
+	case errors.Is(err, circle.ErrInsufficientFunds):
+		response.ErrorWithCode(c, http.StatusUnprocessableEntity, "INSUFFICIENT_FUNDS", err.Error())
 	case errors.Is(err, circle.ErrAlreadyMember):
 		response.Conflict(c, err.Error())
 	case errors.Is(err, circle.ErrNotMember):
@@ -404,14 +406,15 @@ func (h *CircleHandler) buildPayoutPreview(cir *circle.Circle, reqAmount *float6
 		gross = cir.ContributionAmount * float64(members)
 	}
 	// Two-decimal money rounding so gross/fee/net stay consistent in USDC.
-	gross = math.Round(gross*100) / 100
+	// Floor (not round) to match the on-chain SplitFee truncation exactly.
+	gross = math.Floor(gross*100) / 100
 
 	protocolFee := 0.0
 	if reqFee != nil && *reqFee >= 0 {
 		protocolFee = *reqFee
 	} else {
 		// 0.5% default protocol fee on payouts only (spec + transparency page).
-		protocolFee = math.Round(gross*0.005*100) / 100
+		protocolFee = math.Floor(gross*0.005*100) / 100
 	}
 
 	net := gross - protocolFee
@@ -637,6 +640,14 @@ func (h *CircleHandler) TriggerPayout(c *gin.Context) {
 			response.Conflict(c, err.Error())
 			return
 		}
+		if errors.Is(err, apperrors.ErrCircleSuspended) {
+			response.ErrorWithCode(c, http.StatusUnprocessableEntity, "CIRCLE_SUSPENDED", err.Error())
+			return
+		}
+		if strings.Contains(err.Error(), "on-chain verification failed") {
+			response.ErrorWithCode(c, http.StatusUnprocessableEntity, "ONCHAIN_VERIFICATION_FAILED", err.Error())
+			return
+		}
 		response.InternalError(c, "failed to record payout: "+err.Error())
 		return
 	}
@@ -748,6 +759,8 @@ func mapJoinError(c *gin.Context, err error) {
 		response.BadRequest(c, "invalid circle ID")
 	case errors.Is(err, circle.ErrCircleFull):
 		response.Conflict(c, "this circle is full")
+	case errors.Is(err, circle.ErrInsufficientFunds):
+		response.ErrorWithCode(c, http.StatusUnprocessableEntity, "INSUFFICIENT_FUNDS", err.Error())
 	case errors.Is(err, circle.ErrInvalidInvite):
 		response.BadRequest(c, "this circle is invite-only: enter the organizer's invite code to join")
 	case errors.Is(err, circle.ErrMoiScoreTooLow):
@@ -875,8 +888,12 @@ func mapContributeError(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, apperrors.ErrCircleEnded):
 		response.ErrorWithCode(c, http.StatusUnprocessableEntity, "CIRCLE_ENDED", msg)
+	case errors.Is(err, apperrors.ErrCircleSuspended):
+		response.ErrorWithCode(c, http.StatusUnprocessableEntity, "CIRCLE_SUSPENDED", msg)
 	case errors.Is(err, apperrors.ErrLateContributionRejected):
 		response.ErrorWithCode(c, http.StatusUnprocessableEntity, "LATE_CONTRIBUTION", msg)
+	case errors.Is(err, apperrors.ErrDuplicateContribution):
+		response.ErrorWithCode(c, http.StatusConflict, "DUPLICATE_CONTRIBUTION", msg)
 	case strings.Contains(msg, "user is not a member"):
 		response.Forbidden(c, msg)
 	case strings.Contains(msg, "on-chain verification failed"):
@@ -967,7 +984,13 @@ func circlePayoutCompletion(members []circle.CircleMember, paid map[string]bool)
 
 func (h *CircleHandler) GetMembers(c *gin.Context) {
 	circleID := c.Param("id")
-	members, err := h.circleService.GetMembers(c.Request.Context(), circleID)
+	var members []circle.CircleMember
+	var err error
+	if search := strings.TrimSpace(c.Query("search")); search != "" {
+		members, err = h.circleService.SearchMembers(c.Request.Context(), circleID, search)
+	} else {
+		members, err = h.circleService.GetMembers(c.Request.Context(), circleID)
+	}
 	if err != nil {
 		response.InternalError(c, "failed to get members")
 		return

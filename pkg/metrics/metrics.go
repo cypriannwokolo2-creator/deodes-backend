@@ -26,6 +26,11 @@ var (
 		Help: "Total HTTP error responses (status >= 400)",
 	}, []string{"method", "path", "status"})
 
+	EmailsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "deodes_emails_total",
+		Help: "Total transactional email attempts by kind (otp/recovery/backup_codes/notification) and result (sent/rejected/failed/cancelled/skipped_dev_mode)",
+	}, []string{"kind", "result"})
+
 	WSActiveConnections = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "deodes_websocket_active_connections",
 		Help: "Current number of active WebSocket connections",

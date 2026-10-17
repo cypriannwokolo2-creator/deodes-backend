@@ -2264,12 +2264,10 @@
         "circle.CircleCurrency": {
             "type": "string",
             "enum": [
-                "USDC",
-                "XLM"
+                "USDC"
             ],
             "x-enum-varnames": [
-                "CurrencyUSDC",
-                "CurrencyXLM"
+                "CurrencyUSDC"
             ]
         },
         "circle.CircleFrequency": {
@@ -2331,8 +2329,7 @@
                 },
                 "currency": {
                     "enum": [
-                        "USDC",
-                        "XLM"
+                        "USDC"
                     ],
                     "allOf": [
                         {

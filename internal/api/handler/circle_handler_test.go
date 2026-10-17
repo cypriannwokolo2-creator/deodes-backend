@@ -852,6 +852,7 @@ func TestCircleHandler_AuctionBid_Success(t *testing.T) {
 
 	repo.On("FindByID", mock.Anything, cid).Return(c, nil)
 	repo.On("FindMemberByCircleAndUser", mock.Anything, cid, bidderID).Return(bidder, nil)
+	repo.On("GetAuctionBidsByRound", mock.Anything, cid, 1).Return([]circle.CircleAuctionBid{}, nil)
 	repo.On("CreateAuctionBid", mock.Anything, mock.AnythingOfType("*circle.CircleAuctionBid")).Return(nil)
 
 	h := handler.NewCircleHandler(svc, nil, nil, nil)

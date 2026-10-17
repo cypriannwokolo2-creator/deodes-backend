@@ -274,7 +274,7 @@ func TestCircleService_Join_LegacyRailRejected(t *testing.T) {
 
 	c := &circle.Circle{
 		ID: uuid.MustParse(cid), Name: "Legacy", Status: circle.CircleStatusActive,
-		MaxMembers: 10, CircleType: circle.CircleTypePublic, Currency: circle.CurrencyXLM,
+		MaxMembers: 10, CircleType: circle.CircleTypePublic, Currency: circle.CircleCurrency("XLM"),
 	}
 	repo.On("FindByID", ctx, mock.AnythingOfType("uuid.UUID")).Return(c, nil)
 
@@ -628,6 +628,7 @@ func TestCircleService_SubmitAuctionBid_Success(t *testing.T) {
 
 	repo.On("FindByID", ctx, cid).Return(c, nil)
 	repo.On("FindMemberByCircleAndUser", ctx, cid, bidderID).Return(bidder, nil)
+	repo.On("GetAuctionBidsByRound", ctx, cid, 1).Return([]circle.CircleAuctionBid{}, nil)
 	repo.On("CreateAuctionBid", ctx, mock.AnythingOfType("*circle.CircleAuctionBid")).Return(nil)
 
 	bid, err := svc.SubmitAuctionBid(ctx, cid.String(), bidderID.String(), circle.AuctionBidInput{

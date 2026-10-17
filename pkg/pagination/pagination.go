@@ -6,6 +6,9 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// Parse reads page + size from the query string. T056: both `limit` and
+// `page_size` are accepted as the size key (frontend sends `limit`, older
+// tests use `page_size`); limit is clamped to [1,100], page defaults to 1.
 func Parse(c *gin.Context) (page int, limit int, offset int) {
 	page = 1
 	limit = 20

@@ -32,18 +32,22 @@ func userRows(deletedAt interface{}) *sqlmock.Rows {
 		deleted = v
 	}
 	return sqlmock.NewRows([]string{
-		"id", "wallet_address", "email", "phone", "display_name", "avatar_ipfs_hash",
+		"id", "wallet_address", "email", "username", "phone", "display_name", "avatar_ipfs_hash",
 		"country_code", "preferred_language", "moi_score", "role",
 		"session_ttl_minutes", "password_hash", "totp_secret", "totp_enabled",
 		"backup_codes", "email_verified", "passkey_credential_id",
 		"notification_channels", "notifications_muted", "digest_enabled", "digest_interval_minutes", "push_token",
+		"savings_auto_reserve", "savings_default_target", "savings_default_frequency",
+		"savings_notify_on_milestone", "savings_milestone_threshold", "preferred_currency",
 		"created_at", "updated_at", "deleted_at",
 	}).AddRow(
-		uuid.New(), "GABC", "a@b.c", nil, "Ada", nil,
+		uuid.New(), "GABC", "a@b.c", "ada", nil, "Ada", nil,
 		"NG", "en", 100, "user",
 		60, "hash", nil, false,
 		nil, true, nil,
 		nil, false, false, 1440, nil,
+		false, 100, "monthly",
+		true, 50, "NGN",
 		time.Now(), time.Now(), deleted,
 	)
 }
@@ -250,8 +254,8 @@ func TestAllLookupsUseSharedProjection(t *testing.T) {
 	// step with the scan targets in scanUser.
 	assert.Contains(t, userColumns, "digest_enabled")
 	assert.Contains(t, userColumns, "digest_interval_minutes")
-	assert.Equal(t, 25, len(splitColumns(userColumns)),
-		"userColumns must stay in step with the 25 scan targets in scanUser")
+	assert.Equal(t, 32, len(splitColumns(userColumns)),
+		"userColumns must stay in step with the 32 scan targets in scanUser")
 }
 
 func splitColumns(s string) []string {

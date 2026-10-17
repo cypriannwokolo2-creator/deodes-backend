@@ -2,6 +2,7 @@ package arc
 
 import (
 	"encoding/hex"
+	"fmt"
 	"math/big"
 	"strings"
 	"testing"
@@ -139,4 +140,54 @@ func TestMustHexToAddress(t *testing.T) {
 		_, err := MustHexToAddress(bad)
 		assert.Error(t, err, bad)
 	}
+}
+
+func transferFixture(t *testing.T, token, to string, baseUnits uint64) Log {
+	t.Helper()
+	pad := func(addr string) string {
+		h := strings.TrimPrefix(strings.ToLower(addr), "0x")
+		return "0x" + strings.Repeat("0", 64-len(h)) + h
+	}
+	return Log{
+		Address: token,
+		Topics: []string{
+			TransferEventSig,
+			pad("0x1111111111111111111111111111111111111111"),
+			pad(to),
+		},
+		Data: fmt.Sprintf("0x%064x", baseUnits),
+	}
+}
+
+func TestMaxTransferValue(t *testing.T) {
+	token := "0x3600000000000000000000000000000000000000"
+	to := "0x742d35Cc6634C0532925a3b844Bc454e4438f44e"
+
+	assert.Nil(t, MaxTransferValue(nil, token), "nil logs match nothing")
+	assert.Nil(t, MaxTransferValue([]Log{}, token), "empty logs match nothing")
+	assert.Nil(t, MaxTransferValue([]Log{transferFixture(t, token, to, 100)}, ""), "empty token matches nothing")
+
+	logs := []Log{
+		transferFixture(t, token, to, 100),
+		transferFixture(t, token, to, 500),
+		transferFixture(t, "0x0000000000000000000000000000000000000001", to, 999999),
+	}
+	assert.Equal(t, "500", MaxTransferValue(logs, token).String(), "picks max from the token contract only")
+
+	// Malformed entries are skipped, never fatal.
+	bad := transferFixture(t, token, to, 700)
+	bad.Data = "0xzzzz"
+	assert.Equal(t, "500", MaxTransferValue(append(logs, bad), token).String())
+	short := transferFixture(t, token, to, 800)
+	short.Topics = short.Topics[:2]
+	assert.Equal(t, "500", MaxTransferValue(append(logs, short), token).String())
+	assert.Nil(t, MaxTransferValue([]Log{bad, short}, token))
+}
+
+func TestUSDCFloatToBaseUnits(t *testing.T) {
+	assert.Equal(t, "100000000", USDCFloatToBaseUnits(100.0).String())
+	assert.Equal(t, "100000", USDCFloatToBaseUnits(0.1).String())
+	assert.Equal(t, "1", USDCFloatToBaseUnits(0.000001).String())
+	assert.Equal(t, "0", USDCFloatToBaseUnits(0).String())
+	assert.Equal(t, "0", USDCFloatToBaseUnits(-5).String())
 }
